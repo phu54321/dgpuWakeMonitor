@@ -174,11 +174,14 @@ sealed class MainForm : Form
             _live.Sleep += (id, t, d) => BeginInvoke(() => OnLiveSleep(id, t, d));
             _live.WakeFailed += (id, status) => BeginInvoke(() => OnLiveWakeFailed(id, status));
             _live.Ignored += (t, proc, why) => BeginInvoke(() => Log($"[{t.ToLocalTime():HH:mm:ss.fff}] D0 request from {proc} not counted: {why}"));
-            _live.NameResolved += (pid, name) => BeginInvoke(() =>
+            _live.NameResolved += (ids, name) => BeginInvoke(() =>
             {
-                foreach (ListViewItem it in _list.Items)
-                    if (it.Tag is LiveWake w && w.Pid == pid) it.SubItems[1].Text = name;
-                Log($"  pid {pid} = {name}");
+                foreach (var id in ids)
+                    if (_liveRows.TryGetValue(id, out var it) && it.SubItems[1].Text != name)
+                    {
+                        Log($"  wake #{id}: process is {name} (was shown as {it.SubItems[1].Text})");
+                        it.SubItems[1].Text = name;
+                    }
             });
             _live.Start();
             _startedAt = DateTime.Now;

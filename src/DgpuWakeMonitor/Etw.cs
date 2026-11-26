@@ -100,8 +100,14 @@ sealed class LiveMonitor : IDisposable
     readonly TraceEventSession _session;
     readonly string _instanceId;
     readonly PowerTracker _tracker;
-    readonly Dictionary<int, string> _names = new();
-    readonly HashSet<int> _unnamed = new();
+    // Process lifetimes per pid, from Kernel-Process start/stop events whenever they arrive: they can
+    // arrive several seconds late and pids are reused quickly, so a name is looked up by the wake's time.
+    sealed class Life { public string Name = ""; public DateTime? Start; public DateTime? Stop; }
+    readonly Dictionary<int, List<Life>> _lives = new();
+    // Recent wakes and the name shown for each; re-resolved when lifetimes change, so a guess made
+    // before the relevant process events arrived corrects itself.
+    sealed class Shown { public int Id; public int Pid; public DateTime Time; public string Name = ""; public string? Guess; }
+    readonly List<Shown> _shown = new();
     readonly List<PowerEvt> _queue = new();
     readonly object _lock = new();
     readonly System.Threading.Timer _flushTimer;
@@ -115,8 +121,8 @@ sealed class LiveMonitor : IDisposable
     public event Action<int, uint>? WakeFailed;
     /// <summary>A D0 request that did not count as a wake (time, process, why).</summary>
     public event Action<DateTime, string, string>? Ignored;
-    /// <summary>A wake was reported before its process name was known; this delivers the name later.</summary>
-    public event Action<int, string>? NameResolved;
+    /// <summary>The process name shown for these wake ids was wrong or a guess; this is the better name.</summary>
+    public event Action<IReadOnlyList<int>, string>? NameResolved;
 
     public long EventCount => Interlocked.Read(ref _events);
     public int WakeCount { get { lock (_lock) return _tracker.CountedWakes; } }
@@ -126,10 +132,10 @@ sealed class LiveMonitor : IDisposable
     {
         _instanceId = instanceId;
         _tracker = new PowerTracker(initialState);
-        _tracker.WakeStarted += w => Wake?.Invoke(new LiveWake(w.Id, w.Time, w.Pid, w.Tid, NameOf(w.Pid), w.Reason, w.PriorStateKnown));
+        _tracker.WakeStarted += w => Wake?.Invoke(new LiveWake(w.Id, w.Time, w.Pid, w.Tid, Track(w.Id, w.Pid, w.Time), w.Reason, w.PriorStateKnown));
         _tracker.WakeEnded += w => Sleep?.Invoke(w.Id, w.SleptAt!.Value, w.SleptAt.Value - w.Time);
         _tracker.WakeFailed += w => WakeFailed?.Invoke(w.Id, w.FailStatus ?? 0);
-        _tracker.RequestIgnored += r => Ignored?.Invoke(r.Time, NameOf(r.Pid), r.Why);
+        _tracker.RequestIgnored += r => Ignored?.Invoke(r.Time, NameAt(r.Pid, r.Time, Guess(r.Pid)), r.Why);
 
         _session = new TraceEventSession(Etw.LiveSessionName) { StopOnDispose = true };
         _session.EnableProvider(Etw.KernelProcess, TraceEventLevel.Informational, Etw.KernelProcessKeyword);
@@ -152,14 +158,15 @@ sealed class LiveMonitor : IDisposable
 
         if (e.ProviderGuid == Etw.KernelProcess)
         {
-            // Start events can arrive after the wake they explain; stop events carry the name too.
             if ((int)e.ID is 1 or 2 && e.PayloadByName("ImageName") is string img && img.Length > 0)
             {
-                int pid = Convert.ToInt32(e.PayloadByName("ProcessID"));
-                string name = Path.GetFileName(img);
-                bool resolved;
-                lock (_lock) { _names[pid] = name; resolved = _unnamed.Remove(pid); }
-                if (resolved) NameResolved?.Invoke(pid, name);
+                List<(int, string)> changes;
+                lock (_lock)
+                {
+                    RecordLife((int)e.ID == 1, Convert.ToInt32(e.PayloadByName("ProcessID")), Path.GetFileName(img), e.TimeStamp);
+                    changes = Reresolve();
+                }
+                foreach (var (id, name) in changes) NameResolved?.Invoke([id], name);
             }
             return;
         }
@@ -181,16 +188,58 @@ sealed class LiveMonitor : IDisposable
         }
     }
 
-    string NameOf(int pid)
+    void RecordLife(bool start, int pid, string name, DateTime t)
     {
-        if (pid == 0) return "Idle";
-        if (pid == 4) return "System";
+        if (!_lives.TryGetValue(pid, out var list)) _lives[pid] = list = new();
+        if (start) { list.Add(new Life { Name = name, Start = t }); return; }
+        var life = list.Where(l => l.Stop == null && (l.Start == null || l.Start <= t)).MaxBy(l => l.Start ?? DateTime.MinValue);
+        if (life != null) life.Stop = t;
+        else list.Add(new Life { Name = name, Stop = t }); // started before the session
+    }
+
+    /// <summary>Name of the process that had this pid at time t, if the lifetimes seen so far say so.</summary>
+    string? Resolve(int pid, DateTime t)
+    {
+        if (!_lives.TryGetValue(pid, out var list)) return null;
+        return (list.Where(l => l.Start <= t && l.Stop >= t).MaxBy(l => l.Start)
+             ?? list.Where(l => l.Start <= t && l.Stop == null).MaxBy(l => l.Start)
+             ?? list.FirstOrDefault(l => l.Start == null && l.Stop >= t))?.Name;
+    }
+
+    string NameAt(int pid, DateTime t, string? guess) => pid switch
+    {
+        0 => "Idle",
+        4 => "System",
+        _ => Resolve(pid, t) ?? (guess != null ? guess + "?" : $"<pid {pid}>"),
+    };
+
+    static string? Guess(int pid)
+    {
+        try { using var p = System.Diagnostics.Process.GetProcessById(pid); return p.ProcessName + ".exe"; }
+        catch { return null; }
+    }
+
+    string Track(int id, int pid, DateTime t)
+    {
         lock (_lock)
         {
-            if (_names.TryGetValue(pid, out var n)) return n;
-            try { using var p = System.Diagnostics.Process.GetProcessById(pid); return _names[pid] = p.ProcessName + ".exe"; }
-            catch { _unnamed.Add(pid); return $"<pid {pid}>"; }
+            var s = new Shown { Id = id, Pid = pid, Time = t, Guess = Guess(pid) };
+            s.Name = NameAt(pid, t, s.Guess);
+            _shown.RemoveAll(x => x.Time < t - TimeSpan.FromMinutes(10));
+            _shown.Add(s);
+            return s.Name;
         }
+    }
+
+    List<(int Id, string Name)> Reresolve()
+    {
+        var changes = new List<(int, string)>();
+        foreach (var s in _shown)
+        {
+            var n = NameAt(s.Pid, s.Time, s.Guess);
+            if (n != s.Name) { s.Name = n; changes.Add((s.Id, n)); }
+        }
+        return changes;
     }
 
     public void Dispose()
