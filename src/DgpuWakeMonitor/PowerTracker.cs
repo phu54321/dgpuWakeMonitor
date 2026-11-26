@@ -17,16 +17,16 @@ public sealed class TrackedWake
     public int Pid { get; init; }
     public int Tid { get; init; }
     public ulong Irp { get; init; }
-    /// <summary>False when the state before this request was not known (no measurement, no earlier IRP).</summary>
-    public bool PriorStateKnown { get; init; }
+    public int PriorState { get; set; } = -1;
+    public DateTime? AwakeAt { get; set; }
+    public bool Completed => AwakeAt.HasValue;
+    public bool IsConfirmedWake => Completed && PriorState == 3;
     public object? IrpTag { get; init; }
     public int? Reason { get; set; }
     public object? RequestTag { get; set; }
     /// <summary>AdapterFdoContext of the matched DxgKrnl request, if any.</summary>
     public ulong? RequestAdapter { get; set; }
     public DateTime? SleptAt { get; set; }
-    /// <summary>The D0 IRP completed successfully (event 8 seen with a success status).</summary>
-    public bool Completed { get; set; }
     /// <summary>The D0 IRP completed with a failure status: the device did not reach D0.</summary>
     public bool Failed { get; set; }
     public uint? FailStatus { get; set; }
@@ -49,9 +49,8 @@ public sealed record IgnoredRequest(DateTime Time, int Pid, int Tid, string Why,
 
 /// <summary>
 /// Tracks the dGPU device power state from Kernel-Power SET_POWER IRPs (event 7 start, event 8
-/// completion) and turns them into wakes. Only a D0 request made while the device is not known to
-/// be in D0 counts as a wake; a request whose IRP completes with a failure status is marked failed
-/// and the state is rolled back. Events must be fed in timestamp order.
+/// completion). State and D0 intervals advance on successful completions. Request metadata
+/// identifies the initiating thread. Events must be fed in timestamp order.
 /// </summary>
 public sealed class PowerTracker
 {
@@ -64,41 +63,41 @@ public sealed class PowerTracker
     readonly Dictionary<ulong, int> _adapterVotes = new();
     static readonly TimeSpan MatchWindow = TimeSpan.FromMilliseconds(250);
     readonly Dictionary<ulong, Pending> _pending = new();
+    readonly List<TrackedWake> _finished = new();
 
-    sealed record Pending(int PrevState, TrackedWake? Wake, TrackedWake? Closed, bool ClosedInitial);
+    sealed record Pending(PowerEvt Request, TrackedWake? Wake);
 
     /// <param name="initialState">Measured D-state (0..3) when tracing started, or -1 if unknown.</param>
     public PowerTracker(int initialState)
     {
         _state = initialState;
         InitialState = initialState;
-        InitialStateMeasured = initialState >= 0;
     }
 
-    /// <summary>State at the start of the trace: measured, or inferred from the first IRP (-1 if neither).</summary>
-    public int InitialState { get; private set; }
-    public bool InitialStateMeasured { get; }
+    public int InitialState { get; }
     /// <summary>When the device first left D0, if it started the trace in D0.</summary>
     public DateTime? InitialD0End { get; private set; }
     public int State => _state;
 
-    public List<TrackedWake> Wakes { get; } = new();
+    public IEnumerable<TrackedWake> Wakes => _finished.Concat(_pending.Values.Select(p => p.Wake).OfType<TrackedWake>());
     public List<IgnoredRequest> Ignored { get; } = new();
-    public int CountedWakes => Wakes.Count(w => !w.Failed);
+    public int CountedWakes { get; private set; }
+    public int PendingIrps => _pending.Count;
+    public DateTime? UncertainD0End => _state == 0
+        ? _pending.Values.Where(p => p.Request.State != 0).Min(p => (DateTime?)p.Request.Time)
+        : null;
     /// <summary>SET_POWER IRPs seen for the device.</summary>
     public int DeviceIrps { get; private set; }
     /// <summary>Device IRPs without a PowerState field (Kernel-Power event 7 v0): cannot be classified.</summary>
     public int MissingStateIrps { get; private set; }
     /// <summary>
-    /// Low-power requests while the device was already believed to be in low power: the D0 request in
-    /// between was not captured (typically a wake while tracing was still starting).
+    /// Successful D3 requests while already believed to be in D3. A wake may have gone unobserved.
     /// </summary>
     public int MissedWakes { get; private set; }
     public event Action<DateTime>? WakeMissed;
 
-    public event Action<TrackedWake>? WakeStarted;
+    public event Action<TrackedWake>? WakeResolved;
     public event Action<TrackedWake>? WakeEnded;
-    public event Action<TrackedWake>? WakeFailed;
     public event Action<IgnoredRequest>? RequestIgnored;
 
     public void Process(in PowerEvt e)
@@ -114,80 +113,73 @@ public sealed class PowerTracker
     void OnIrpStart(in PowerEvt e)
     {
         DeviceIrps++;
-        if (e.State < 0) { MissingStateIrps++; return; }
-        int prev = _state;
-        if (InitialState < 0) InitialState = e.State == 0 ? 3 : 0; // best guess: a request implies a change
-
+        if (e.State < 0) MissingStateIrps++;
+        TrackedWake? w = null;
         if (e.State == 0)
         {
-            if (prev == 0)
-            {
-                var ig = new IgnoredRequest(e.Time, e.Pid, e.Tid, "device already in D0", e.Tag);
-                Ignored.Add(ig);
-                _pending[e.Irp] = new Pending(prev, null, null, false);
-                RequestIgnored?.Invoke(ig);
-                return;
-            }
-            var w = new TrackedWake
+            w = new TrackedWake
             {
                 Id = ++_nextId, Time = e.Time, Pid = e.Pid, Tid = e.Tid, Irp = e.Irp,
-                PriorStateKnown = prev > 0, IrpTag = e.Tag,
+                IrpTag = e.Tag,
             };
             MatchRequest(w, e);
-            Wakes.Add(w);
-            _open = w;
-            _state = 0;
-            _pending[e.Irp] = new Pending(prev, w, null, false);
-            WakeStarted?.Invoke(w);
         }
-        else
-        {
-            if (prev > 0)
-            {
-                MissedWakes++;
-                WakeMissed?.Invoke(e.Time);
-                _pending[e.Irp] = new Pending(prev, null, null, false);
-                _state = e.State;
-                return;
-            }
-            TrackedWake? closed = null;
-            bool closedInitial = false;
-            if (_open != null)
-            {
-                closed = _open;
-                _open.SleptAt = e.Time;
-                _open = null;
-                WakeEnded?.Invoke(closed);
-            }
-            else if (InitialState == 0 && InitialD0End == null && Wakes.Count == 0)
-            {
-                InitialD0End = e.Time;
-                closedInitial = true;
-            }
-            _state = e.State;
-            _pending[e.Irp] = new Pending(prev, null, closed, closedInitial);
-        }
+        _pending[e.Irp] = new Pending(e, w);
     }
 
     void OnIrpStop(in PowerEvt e)
     {
         if (!_pending.Remove(e.Irp, out var p)) return;
-        if ((int)e.Status >= 0) // NT_SUCCESS
+        if ((int)e.Status < 0)
         {
-            if (p.Wake != null) p.Wake.Completed = true;
+            if (p.Wake is { } failed)
+            {
+                failed.Failed = true;
+                failed.FailStatus = e.Status;
+                _finished.Add(failed);
+                WakeResolved?.Invoke(failed);
+            }
             return;
         }
-        // The transition did not happen: roll the state back.
-        _state = p.PrevState;
-        if (p.Wake != null)
+        int previous = _state;
+        _state = p.Request.State;
+        if (p.Wake is { } w)
         {
-            p.Wake.Failed = true;
-            p.Wake.FailStatus = e.Status;
-            if (_open == p.Wake) _open = null;
-            WakeFailed?.Invoke(p.Wake);
+            if (previous == 0)
+            {
+                var ignored = new IgnoredRequest(w.Time, w.Pid, w.Tid, "device already in D0", w.IrpTag);
+                Ignored.Add(ignored);
+                RequestIgnored?.Invoke(ignored);
+                return;
+            }
+            w.PriorState = previous;
+            w.AwakeAt = e.Time;
+            _open = w;
+            _finished.Add(w);
+            if (w.IsConfirmedWake)
+            {
+                CountedWakes++;
+                if (w.RequestAdapter is { } adapter)
+                    _adapterVotes[adapter] = _adapterVotes.GetValueOrDefault(adapter) + 1;
+            }
+            WakeResolved?.Invoke(w);
         }
-        if (p.Closed != null) { p.Closed.SleptAt = null; _open = p.Closed; }
-        if (p.ClosedInitial) InitialD0End = null;
+        else if (previous == 0)
+        {
+            if (_open is { } open)
+            {
+                open.SleptAt = e.Time;
+                _open = null;
+                WakeEnded?.Invoke(open);
+            }
+            else
+                InitialD0End = e.Time;
+        }
+        else if (previous == 3 && _state == 3)
+        {
+            MissedWakes++;
+            WakeMissed?.Invoke(e.Time);
+        }
     }
 
     void AddRequest(in PowerEvt e)
@@ -215,7 +207,6 @@ public sealed class PowerTracker
         w.Reason = pick.Reason;
         w.RequestTag = pick.Tag;
         w.RequestAdapter = pick.Adapter;
-        _adapterVotes[pick.Adapter] = _adapterVotes.GetValueOrDefault(pick.Adapter) + 1;
     }
 
     ulong? LeadingAdapter => _adapterVotes.Count == 0 ? null : _adapterVotes.MaxBy(kv => kv.Value).Key;

@@ -173,8 +173,7 @@ sealed class MainForm : Form
             _live = new LiveMonitor(_device.InstanceId, _initialState);
             _live.Wake += w => BeginInvoke(() => OnLiveWake(w));
             _live.Sleep += (id, t, d) => BeginInvoke(() => OnLiveSleep(id, t, d));
-            _live.WakeFailed += (id, status) => BeginInvoke(() => OnLiveWakeFailed(id, status));
-            _live.WakeMissed += t => BeginInvoke(() => Log($"[{t.ToLocalTime():HH:mm:ss.fff}] SLEEP D0→D3 without a captured wake: a wake was missed (likely while tracing was starting)"));
+            _live.WakeMissed += t => BeginInvoke(() => Log($"[{t.ToLocalTime():HH:mm:ss.fff}] D3 request completed while the last known state was D3. A wake may have been missed."));
             _live.Ignored += (t, proc, why) => BeginInvoke(() => Log($"[{t.ToLocalTime():HH:mm:ss.fff}] D0 request from {proc} not counted: {why}"));
             _live.NameResolved += (ids, name) => BeginInvoke(() =>
             {
@@ -206,24 +205,22 @@ sealed class MainForm : Form
 
     void OnLiveWake(LiveWake w)
     {
-        var item = new ListViewItem([w.Time.ToLocalTime().ToString("HH:mm:ss.fff"), w.Process, w.Pid.ToString(), w.Reason?.ToString() ?? "", "…", "", ""])
-        { Tag = w, ForeColor = Color.Firebrick };
+        bool confirmed = w.PriorState == 3 && w.FailStatus == null;
+        var item = new ListViewItem([w.Time.ToLocalTime().ToString("HH:mm:ss.fff"), w.Process, w.Pid.ToString(), w.Reason?.ToString() ?? "", w.FailStatus != null ? "failed" : "…", "", ""])
+        { Tag = w, ForeColor = confirmed ? Color.Firebrick : SystemColors.GrayText };
         _liveRows[w.Id] = item;
         _list.Items.Add(item);
         item.EnsureVisible();
-        Log($"[{w.Time.ToLocalTime():HH:mm:ss.fff}] WAKE  D3→D0  {w.Process} (pid {w.Pid}, tid {w.Tid}){(w.Reason is { } r ? $"  reason={r}" : "")}{(w.PriorStateKnown ? "" : "  (prior state unknown)")}");
+        var outcome = w.FailStatus is { } status ? $"D0 request failed (0x{status:X8})"
+            : confirmed ? "WAKE  D3→D0"
+            : $"D0 reached (prior state {(w.PriorState < 0 ? "unknown" : $"D{w.PriorState}")})";
+        Log($"[{w.Time.ToLocalTime():HH:mm:ss.fff}] {outcome}  {w.Process} (pid {w.Pid}, tid {w.Tid}){(w.Reason is { } r ? $"  reason={r}" : "")}");
     }
 
     void OnLiveSleep(int id, DateTime t, TimeSpan awake)
     {
         if (_liveRows.TryGetValue(id, out var item)) item.SubItems[4].Text = $"{awake.TotalSeconds:0.00} s";
-        Log($"[{t.ToLocalTime():HH:mm:ss.fff}] SLEEP D0→D3  after {awake.TotalSeconds:0.00} s");
-    }
-
-    void OnLiveWakeFailed(int id, uint status)
-    {
-        if (_liveRows.TryGetValue(id, out var item)) { item.ForeColor = SystemColors.GrayText; item.SubItems[4].Text = "failed"; }
-        Log($"  D0 request #{id} failed (status 0x{status:X8}); not counted");
+        Log($"[{t.ToLocalTime():HH:mm:ss.fff}] D0 interval ended after {awake.TotalSeconds:0.00} s");
     }
 
     async Task StopRecordingAsync()
@@ -277,10 +274,11 @@ sealed class MainForm : Form
     {
         _list.BeginUpdate();
         _list.Items.Clear();
+        _wakes.Text = a.CountedWakes.Count().ToString();
         foreach (var w in a.Wakes)
         {
-            var awake = w.Failed ? "failed" : w.SleptAt is { } s ? $"{(s - w.Time).TotalSeconds:0.00} s" : "until end";
-            var color = w.Failed ? SystemColors.GrayText : w.KernelInitiated ? Color.SteelBlue : Color.Firebrick;
+            var awake = w.Failed ? "failed" : !w.Completed ? "unconfirmed" : $"{a.AwakeDuration(w).TotalSeconds:0.00} s";
+            var color = !w.IsConfirmedWake ? SystemColors.GrayText : w.KernelInitiated ? Color.SteelBlue : Color.Firebrick;
             _list.Items.Add(new ListViewItem([w.Time.ToLocalTime().ToString("HH:mm:ss.fff"), w.ProcessName, w.Pid.ToString(),
                 w.Reason?.ToString() ?? "", awake, w.EntryModule ?? "", w.CallerModule ?? ""]) { ForeColor = color });
         }

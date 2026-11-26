@@ -88,19 +88,19 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
         if (counted.Count == 0)
         {
             if (caveats.Count == 0)
-                sb.Append($"""<div class="verdict good"><b>No dGPU wakes</b><div>{(a.DeviceIrps == 0 ? "No power requests for the discrete GPU" : "No D3 → D0 transition of the discrete GPU")} during the {Dur(a.Duration)} recording.</div></div>""");
+                sb.Append($"""<div class="verdict good"><b>No confirmed dGPU wakes</b><div>{(a.DeviceIrps == 0 ? "No power requests for the discrete GPU were captured" : "No D3 → D0 transition of the discrete GPU was confirmed")} during the {Dur(a.Duration)} recording.</div></div>""");
         }
         else
         {
             var top = counted.GroupBy(w => w.ProcessName).OrderByDescending(g => g.Count()).First();
             var plural = counted.Count == 1 ? "" : "s";
-            sb.Append($"<div class=\"verdict bad\"><b>{counted.Count} dGPU wake{plural}</b><div>Most frequent culprit: <b>{H(top.Key)}</b> ({top.Count()}×). The dGPU was awake {pct:0.0}% of the recording.</div></div>");
+            sb.Append($"<div class=\"verdict bad\"><b>{counted.Count} confirmed dGPU wake{plural}</b><div>Most frequent culprit: <b>{H(top.Key)}</b> ({top.Count()}×).</div></div>");
         }
 
         sb.Append("<div class=\"stats\">");
         Stat(sb, counted.Count.ToString(), "wakes (D3 → D0)");
-        Stat(sb, Dur(a.TimeInD0), "time in D0");
-        Stat(sb, $"{pct:0.0}%", "D0 residency");
+        Stat(sb, Dur(a.TimeInD0), "observed time in D0");
+        Stat(sb, $"{pct:0.0}%", "observed D0 residency");
         Stat(sb, Dur(a.Duration), "recording length");
         sb.Append("</div>");
 
@@ -114,7 +114,7 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
         foreach (var (from, to, w) in a.D0Intervals)
             Seg(from, to, w == null ? "D0 at start of recording" : $"{w.ProcessName} · {Ts(w.Time)} · {Dur(to - from)}");
         sb.Append($"</div><div class=\"axis\"><span>{Ts(a.Start)}</span><span>{Ts(a.Start + a.Duration / 2)}</span><span>{Ts(a.End)}</span></div>");
-        sb.Append("<div class=\"legend\"><i style=\"background:var(--d0)\"></i>D0 awake<i style=\"background:var(--d3)\"></i>D3 asleep / idle</div></div>");
+        sb.Append("<div class=\"legend\"><i style=\"background:var(--d0)\"></i>D0 observed<i style=\"background:var(--d3)\"></i>Low power or unknown</div></div>");
 
         // Culprits
         if (counted.Count > 0)
@@ -122,7 +122,7 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
             sb.Append("<h2>Culprits</h2><div class=\"card scroll\"><table><tr><th>Process</th><th class=\"num\">Wakes</th><th class=\"num\">Time in D0</th><th>Entry module</th><th>Caller module</th></tr>");
             foreach (var g in counted.GroupBy(w => w.ProcessName).OrderByDescending(g => g.Count()).ThenBy(g => g.Key))
             {
-                var d0 = TimeSpan.FromTicks(g.Sum(w => ((w.SleptAt ?? a.End) - w.Time).Ticks));
+                var d0 = TimeSpan.FromTicks(g.Sum(w => a.AwakeDuration(w).Ticks));
                 string mods(Func<WakeRecord, string?> f) => H(string.Join(", ", g.Select(f).Where(m => m != null).Distinct()));
                 sb.Append($"<tr><td><b>{H(g.Key)}</b></td><td class=\"num\">{g.Count()}</td><td class=\"num\">{Dur(d0)}</td><td class=\"mono\">{mods(w => w.EntryModule)}</td><td class=\"mono\">{mods(w => w.CallerModule)}</td></tr>");
             }
@@ -130,7 +130,7 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
         }
 
         // Wake details
-        if (a.Wakes.Count > 0) sb.Append("<h2>Wake events</h2>");
+        if (a.Wakes.Count > 0) sb.Append("<h2>D0 requests</h2>");
         int i = 0;
         foreach (var w in a.Wakes)
         {
@@ -138,15 +138,22 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
             sb.Append($"<div class=\"card wake{(w.KernelInitiated || w.Failed ? " sys" : "")}\"><h3>#{i} · {Ts(w.Time)} · {H(w.ProcessName)}");
             sb.Append($"<span class=\"tag\">+{Dur(w.Time - a.Start)}</span>");
             if (w.Failed) sb.Append($"<span class=\"tag\">request failed · not counted</span>");
-            if (!w.PriorStateKnown) sb.Append("<span class=\"tag\">prior state unknown</span>");
+            if (!w.Failed && !w.Completed) sb.Append("<span class=\"tag\">completion missing</span>");
+            if (w.Completed && !w.IsConfirmedWake)
+                sb.Append($"<span class=\"tag\">{State(w.PriorState)} → D0 · outside D3 wake count</span>");
             if (w.KernelInitiated) sb.Append("<span class=\"tag\">kernel-initiated</span>");
             sb.Append("</h3><table class=\"kv\">");
             Row(sb, "Process", $"{H(w.ProcessName)} (PID {w.Pid}, TID {w.Tid})");
             if (w.ImagePath != null) Row(sb, "Image", $"<span class=\"mono\">{H(w.ImagePath)}</span>");
             if (w.CommandLine != null) Row(sb, "Command line", $"<span class=\"mono\">{H(w.CommandLine)}</span>");
-            if (w.Failed) Row(sb, "D0 request", $"failed with status <span class=\"mono\">0x{w.FailStatus:X8}</span>; the device stayed in its low-power state");
-            else Row(sb, "Awake for", w.SleptAt is { } s ? $"{Dur(s - w.Time)} (back to D3 at {Ts(s)})" : "still in D0 when recording stopped");
-            if (!w.Failed && !w.Completed) Row(sb, "Completion", "<span style=\"color:var(--muted)\">IRP completion not seen in the trace</span>");
+            if (w.Failed) Row(sb, "D0 request", $"failed with status <span class=\"mono\">0x{w.FailStatus:X8}</span>");
+            if (w.Completed)
+            {
+                Row(sb, "Awake for", $"{Dur(a.AwakeDuration(w))} (observed through {Ts(a.D0End(w))})");
+                Row(sb, "D0 completion", Ts(w.AwakeAt!.Value));
+            }
+            else if (!w.Failed)
+                Row(sb, "Completion", "<span style=\"color:var(--muted)\">IRP completion not seen in the trace</span>");
             Row(sb, "Entry module", w.EntryModule != null ? $"<span class=\"mono\">{H(w.EntryModule)}</span>" : "<span style=\"color:var(--muted)\">no user-mode frames</span>");
             if (w.CallerModule != null) Row(sb, "Caller module", $"<span class=\"mono\">{H(w.CallerModule)}</span>");
             Row(sb, "DxgKrnl reason", w.ReasonMatch switch
@@ -191,7 +198,7 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
         Row(sb, "Instance ID", $"<span class=\"mono\">{H(ctx.Device.InstanceId)}</span>");
         Row(sb, "Started", H(a.Start.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")));
         Row(sb, "Duration", Dur(a.Duration));
-        Row(sb, "State at start", State(a.InitialState) + (a.InitialState < 0 ? "" : a.InitialStateMeasured ? " · measured" : " · inferred from the first request"));
+        Row(sb, "State at start", State(a.InitialState));
         Row(sb, "State at end", State(ctx.StateAtEnd));
         Row(sb, "Events in trace", a.TotalEvents.ToString("N0"));
         Row(sb, "Events lost", a.EventsLost == 0 ? "0" : $"<b style=\"color:var(--bad)\">{a.EventsLost:N0}</b>");

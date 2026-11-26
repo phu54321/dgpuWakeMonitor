@@ -40,23 +40,23 @@ static class Etw
     public static PowerEvt? Parse(TraceEvent e, string instanceId, Func<TraceEvent, PowerEvtKind, object?>? tagger = null)
     {
         if (e.ProviderGuid == DxgKrnl && (int)e.ID == PowerRequestDuringD3Id)
-            return new PowerEvt(PowerEvtKind.DxgRequest, e.TimeStamp, e.ProcessID, e.ThreadID,
+            return new PowerEvt(PowerEvtKind.DxgRequest, e.TimeStamp.ToUniversalTime(), e.ProcessID, e.ThreadID,
                 Reason: Convert.ToInt32(e.PayloadByName("Reason") ?? 0),
                 Adapter: Convert.ToUInt64(e.PayloadByName("AdapterFdoContext") ?? 0UL),
                 Tag: tagger?.Invoke(e, PowerEvtKind.DxgRequest));
 
         if (e.ProviderGuid != KernelPower) return null;
 
-        if ((int)e.ID == IrpStopId)
-            return new PowerEvt(PowerEvtKind.IrpStop, e.TimeStamp, e.ProcessID, e.ThreadID,
+        if ((int)e.ID == IrpStopId && e.PayloadByName("Status") is { } status)
+            return new PowerEvt(PowerEvtKind.IrpStop, e.TimeStamp.ToUniversalTime(), e.ProcessID, e.ThreadID,
                 Irp: Convert.ToUInt64(e.PayloadByName("Irp") ?? 0UL),
-                Status: Convert.ToUInt32(e.PayloadByName("Status") ?? 0u));
+                Status: unchecked((uint)Convert.ToInt64(status)));
 
         if ((int)e.ID != IrpStartId) return null;
         if (Convert.ToInt32(e.PayloadByName("PowerStateType") ?? -1) != 1) return null;
         if (Convert.ToInt32(e.PayloadByName("MinorFunction") ?? -1) != 2) return null;
         if (!string.Equals(e.PayloadByName("InstanceName") as string, instanceId, StringComparison.OrdinalIgnoreCase)) return null;
-        return new PowerEvt(PowerEvtKind.IrpStart, e.TimeStamp, e.ProcessID, e.ThreadID,
+        return new PowerEvt(PowerEvtKind.IrpStart, e.TimeStamp.ToUniversalTime(), e.ProcessID, e.ThreadID,
             Irp: Convert.ToUInt64(e.PayloadByName("Irp") ?? 0UL),
             State: Convert.ToInt32(e.PayloadByName("PowerState") ?? -1),
             Tag: tagger?.Invoke(e, PowerEvtKind.IrpStart));
@@ -86,7 +86,7 @@ public sealed record RecordingMeta(string InstanceId, string DeviceName, int Ini
 }
 
 /// <summary>A dGPU D3->D0 wake seen by the live session (no stacks; those come from the ETL).</summary>
-public sealed record LiveWake(int Id, DateTime Time, int Pid, int Tid, string Process, int? Reason, bool PriorStateKnown);
+public sealed record LiveWake(int Id, DateTime Time, int Pid, int Tid, string Process, int? Reason, int PriorState, uint? FailStatus);
 
 /// <summary>
 /// Real-time session: counts events and reports wakes/sleeps as they happen. Real-time ETW delivers
@@ -102,8 +102,8 @@ sealed class LiveMonitor : IDisposable
     readonly PowerTracker _tracker;
     // Process lifetimes per pid, from Kernel-Process start/stop events whenever they arrive: they can
     // arrive several seconds late and pids are reused quickly, so a name is looked up by the wake's time.
-    sealed class Life { public string Name = ""; public DateTime? Start; public DateTime? Stop; }
-    readonly Dictionary<int, List<Life>> _lives = new();
+    sealed record Life(string Name, DateTime? Stop);
+    readonly Dictionary<int, SortedList<DateTime, Life>> _lives = new();
     // Recent wakes and the name shown for each; re-resolved when lifetimes change, so a guess made
     // before the relevant process events arrived corrects itself.
     sealed class Shown { public int Id; public int Pid; public DateTime Time; public string Name = ""; public string? Guess; }
@@ -115,11 +115,9 @@ sealed class LiveMonitor : IDisposable
     long _events;
 
     public event Action<LiveWake>? Wake;
-    /// <summary>The wake with this id ended (device back to D3) after the given time awake.</summary>
+    /// <summary>The confirmed D0 interval with this id ended.</summary>
     public event Action<int, DateTime, TimeSpan>? Sleep;
-    /// <summary>The D0 request for this wake failed (status); it is no longer counted.</summary>
-    public event Action<int, uint>? WakeFailed;
-    /// <summary>The device went to low power without a captured D0 request: a wake was missed.</summary>
+    /// <summary>A repeated D3 completion may indicate an uncaptured wake.</summary>
     public event Action<DateTime>? WakeMissed;
     /// <summary>A D0 request that did not count as a wake (time, process, why).</summary>
     public event Action<DateTime, string, string>? Ignored;
@@ -134,18 +132,17 @@ sealed class LiveMonitor : IDisposable
     {
         _instanceId = instanceId;
         _tracker = new PowerTracker(initialState);
-        _tracker.WakeStarted += w => Wake?.Invoke(new LiveWake(w.Id, w.Time, w.Pid, w.Tid, Track(w.Id, w.Pid, w.Time), w.Reason, w.PriorStateKnown));
-        _tracker.WakeEnded += w => Sleep?.Invoke(w.Id, w.SleptAt!.Value, w.SleptAt.Value - w.Time);
-        _tracker.WakeFailed += w => WakeFailed?.Invoke(w.Id, w.FailStatus ?? 0);
+        _tracker.WakeResolved += w => Wake?.Invoke(new LiveWake(w.Id, w.Time, w.Pid, w.Tid, Track(w.Id, w.Pid, w.Time), w.Reason, w.PriorState, w.FailStatus));
+        _tracker.WakeEnded += w => Sleep?.Invoke(w.Id, w.SleptAt!.Value, w.SleptAt.Value - w.AwakeAt!.Value);
         _tracker.WakeMissed += t => WakeMissed?.Invoke(t);
-        _tracker.RequestIgnored += r => Ignored?.Invoke(r.Time, NameAt(r.Pid, r.Time, Guess(r.Pid)), r.Why);
+        _tracker.RequestIgnored += r => Ignored?.Invoke(r.Time, NameAt(r.Pid, r.Time, Guess(r.Pid, r.Time)), r.Why);
 
         _session = new TraceEventSession(Etw.LiveSessionName) { StopOnDispose = true };
         _session.EnableProvider(Etw.KernelProcess, TraceEventLevel.Informational, Etw.KernelProcessKeyword);
         _session.EnableProvider(Etw.DxgKrnl, TraceEventLevel.Verbose, Etw.DxgKrnlDiagnostics);
         _session.EnableProvider(Etw.KernelPower, TraceEventLevel.Verbose, Etw.KernelPowerPerformance);
         _session.Source.Dynamic.All += OnEvent;
-        _flushTimer = new System.Threading.Timer(_ => Flush(DateTime.Now - ReorderDelay), null, Timeout.Infinite, Timeout.Infinite);
+        _flushTimer = new System.Threading.Timer(_ => Flush(DateTime.UtcNow - ReorderDelay), null, Timeout.Infinite, Timeout.Infinite);
     }
 
     public void Start()
@@ -161,13 +158,16 @@ sealed class LiveMonitor : IDisposable
 
         if (e.ProviderGuid == Etw.KernelProcess)
         {
-            if ((int)e.ID is 1 or 2 && e.PayloadByName("ImageName") is string img && img.Length > 0)
+            if ((int)e.ID is 1 or 2 && e.PayloadByName("ImageName") is string img && img.Length > 0
+                && FileTime(e.PayloadByName("CreateTime")) is { } created)
             {
+                int pid = Convert.ToInt32(e.PayloadByName("ProcessID"));
+                DateTime? stopped = (int)e.ID == 2 ? FileTime(e.PayloadByName("ExitTime")) ?? e.TimeStamp.ToUniversalTime() : null;
                 List<(int, string)> changes;
                 lock (_lock)
                 {
-                    RecordLife((int)e.ID == 1, Convert.ToInt32(e.PayloadByName("ProcessID")), Path.GetFileName(img), e.TimeStamp);
-                    changes = Reresolve();
+                    RecordLife(pid, Path.GetFileName(img), created, stopped);
+                    changes = Reresolve(pid);
                 }
                 foreach (var (id, name) in changes) NameResolved?.Invoke([id], name);
             }
@@ -191,22 +191,31 @@ sealed class LiveMonitor : IDisposable
         }
     }
 
-    void RecordLife(bool start, int pid, string name, DateTime t)
+    static DateTime? FileTime(object? value) =>
+        value is DateTime date && date.ToUniversalTime() > DateTime.FromFileTimeUtc(0)
+            ? date.ToUniversalTime() : null;
+
+    void RecordLife(int pid, string name, DateTime created, DateTime? stopped)
     {
         if (!_lives.TryGetValue(pid, out var list)) _lives[pid] = list = new();
-        if (start) { list.Add(new Life { Name = name, Start = t }); return; }
-        var life = list.Where(l => l.Stop == null && (l.Start == null || l.Start <= t)).MaxBy(l => l.Start ?? DateTime.MinValue);
-        if (life != null) life.Stop = t;
-        else list.Add(new Life { Name = name, Stop = t }); // started before the session
+        // Both event types identify the same process by creation time. A late start can
+        // improve the name without discarding a stop that arrived first.
+        list.TryGetValue(created, out var life);
+        list[created] = new Life(stopped == null ? name : life?.Name ?? name, stopped ?? life?.Stop);
     }
 
     /// <summary>Name of the process that had this pid at time t, if the lifetimes seen so far say so.</summary>
     string? Resolve(int pid, DateTime t)
     {
         if (!_lives.TryGetValue(pid, out var list)) return null;
-        return (list.Where(l => l.Start <= t && l.Stop >= t).MaxBy(l => l.Start)
-             ?? list.Where(l => l.Start <= t && l.Stop == null).MaxBy(l => l.Start)
-             ?? list.FirstOrDefault(l => l.Start == null && l.Stop >= t))?.Name;
+        t = t.ToUniversalTime();
+        for (int i = list.Count - 1; i >= 0; i--)
+        {
+            if (list.Keys[i] > t) continue;
+            var life = list.Values[i];
+            return life.Stop == null || t <= life.Stop ? life.Name : null;
+        }
+        return null;
     }
 
     string NameAt(int pid, DateTime t, string? guess) => pid switch
@@ -216,9 +225,13 @@ sealed class LiveMonitor : IDisposable
         _ => Resolve(pid, t) ?? (guess != null ? guess + "?" : $"<pid {pid}>"),
     };
 
-    static string? Guess(int pid)
+    static string? Guess(int pid, DateTime time)
     {
-        try { using var p = System.Diagnostics.Process.GetProcessById(pid); return p.ProcessName + ".exe"; }
+        try
+        {
+            using var p = System.Diagnostics.Process.GetProcessById(pid);
+            return p.StartTime.ToUniversalTime() <= time.ToUniversalTime() ? p.ProcessName + ".exe" : null;
+        }
         catch { return null; }
     }
 
@@ -226,7 +239,7 @@ sealed class LiveMonitor : IDisposable
     {
         lock (_lock)
         {
-            var s = new Shown { Id = id, Pid = pid, Time = t, Guess = Guess(pid) };
+            var s = new Shown { Id = id, Pid = pid, Time = t, Guess = Guess(pid, t) };
             s.Name = NameAt(pid, t, s.Guess);
             _shown.RemoveAll(x => x.Time < t - TimeSpan.FromMinutes(10));
             _shown.Add(s);
@@ -234,11 +247,12 @@ sealed class LiveMonitor : IDisposable
         }
     }
 
-    List<(int Id, string Name)> Reresolve()
+    List<(int Id, string Name)> Reresolve(int pid)
     {
         var changes = new List<(int, string)>();
         foreach (var s in _shown)
         {
+            if (s.Pid != pid) continue;
             var n = NameAt(s.Pid, s.Time, s.Guess);
             if (n != s.Name) { s.Name = n; changes.Add((s.Id, n)); }
         }

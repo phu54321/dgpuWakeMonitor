@@ -27,10 +27,10 @@ public sealed class WakeRecord
     /// <summary>First user-mode module outside Windows / the driver store, i.e. the app code that called in.</summary>
     public string? CallerModule { get; set; }
     public bool KernelInitiated => Pid is 0 or 4;
-    /// <summary>False when the device state before this request could not be established.</summary>
-    public bool PriorStateKnown { get; init; } = true;
-    /// <summary>The D0 IRP completed successfully.</summary>
-    public bool Completed { get; init; }
+    public int PriorState { get; init; } = -1;
+    public DateTime? AwakeAt { get; init; }
+    public bool Completed => AwakeAt.HasValue;
+    public bool IsConfirmedWake => Completed && PriorState == 3;
     /// <summary>The D0 IRP failed (device did not reach D0); not counted as a wake.</summary>
     public bool Failed { get; init; }
     public uint? FailStatus { get; init; }
@@ -48,8 +48,9 @@ public sealed class Analysis
     public required List<IgnoredInfo> Ignored { get; init; }
     /// <summary>D-state at the start (0..3), or -1 if unknown.</summary>
     public int InitialState { get; init; } = -1;
-    public bool InitialStateMeasured { get; init; }
     public DateTime? InitialD0End { get; init; }
+    public DateTime? UncertainD0End { get; init; }
+    public int PendingIrps { get; init; }
     public long TotalEvents { get; init; }
     /// <summary>Events ETW dropped, from the finalized trace.</summary>
     public int EventsLost { get; init; }
@@ -68,19 +69,47 @@ public sealed class Analysis
         {
             if (EventsLost > 0) yield return $"ETW dropped {EventsLost:N0} events while recording, so wakes may be missing.";
             if (PowerIrpEvents == 0) yield return "The trace contains no Kernel-Power IRP events at all, so power transitions could not be observed.";
-            if (MissedWakes > 0) yield return $"The dGPU went back to D3 {MissedWakes} time(s) without a captured D0 request, so a wake was missed (typically one that happened while tracing was still starting).";
+            if (MissedWakes > 0) yield return $"ETW recorded {MissedWakes} successful D3 request(s) while the last known state was D3. There may have been an intervening wake.";
+            if (PendingIrps > 0) yield return $"{PendingIrps} dGPU power request(s) had no matched completion. Their effect on the device state is unknown.";
+            if (Wakes.Any(w => w.Completed && w.PriorState < 0)) yield return "At least one D0 request succeeded with an unknown prior state, so it could not be classified as a D3 → D0 wake.";
             if (MissingStateIrps > 0) yield return $"{MissingStateIrps} of {DeviceIrps} dGPU power requests have no PowerState field (Kernel-Power event 7 version 0, older Windows builds) and could not be classified.";
         }
     }
-    public IEnumerable<WakeRecord> CountedWakes => Wakes.Where(w => !w.Failed);
+    public IEnumerable<WakeRecord> CountedWakes => Wakes.Where(w => w.IsConfirmedWake);
 
-    /// <summary>D0 intervals inside the recording window (open intervals run to the end).</summary>
+    public DateTime D0End(WakeRecord w)
+    {
+        var end = w.SleptAt ?? UncertainD0End ?? End;
+        if (end > End) end = End;
+        return w.AwakeAt is { } from && end < from ? from : end;
+    }
+
+    public TimeSpan AwakeDuration(WakeRecord w) => w.AwakeAt is { } from
+        ? SpanWithinTrace(from, D0End(w)) : TimeSpan.Zero;
+
+    TimeSpan SpanWithinTrace(DateTime from, DateTime to)
+    {
+        from = from < Start ? Start : from;
+        to = to > End ? End : to;
+        return to > from ? to - from : TimeSpan.Zero;
+    }
+
+    /// <summary>D0 intervals based on successful requests and the initial measurement.</summary>
     public IEnumerable<(DateTime From, DateTime To, WakeRecord? Wake)> D0Intervals
     {
         get
         {
-            if (InitialState == 0) yield return (Start, InitialD0End ?? End, null);
-            foreach (var w in CountedWakes) yield return (w.Time, w.SleptAt ?? End, w);
+            if (InitialState == 0)
+            {
+                var duration = SpanWithinTrace(Start, InitialD0End ?? UncertainD0End ?? End);
+                if (duration > TimeSpan.Zero) yield return (Start, Start + duration, null);
+            }
+            foreach (var w in Wakes.Where(w => w.Completed).OrderBy(w => w.AwakeAt))
+            {
+                var duration = AwakeDuration(w);
+                var from = w.AwakeAt!.Value < Start ? Start : w.AwakeAt.Value;
+                if (duration > TimeSpan.Zero) yield return (from, from + duration, w);
+            }
         }
     }
 
@@ -139,7 +168,7 @@ static class Analyzer
 
             var wakes = new List<WakeRecord>();
             var stackSources = new Dictionary<WakeRecord, (TraceCallStack? irp, TraceCallStack? req)>();
-            foreach (var t in tracker.Wakes)
+            foreach (var t in tracker.Wakes.OrderBy(w => w.Time))
             {
                 var info = t.IrpTag as IrpInfo;
                 var match = tracker.MatchQuality(t);
@@ -149,8 +178,8 @@ static class Analyzer
                     Time = t.Time, Pid = t.Pid, Tid = t.Tid,
                     ProcessName = info?.Name ?? NameFor(t.Pid, null),
                     ImagePath = info?.Image, CommandLine = info?.CommandLine,
-                    Reason = useRequest ? t.Reason : null, ReasonMatch = match, SleptAt = t.SleptAt, PriorStateKnown = t.PriorStateKnown,
-                    Completed = t.Completed, Failed = t.Failed, FailStatus = t.FailStatus,
+                    Reason = useRequest ? t.Reason : null, ReasonMatch = match, SleptAt = t.SleptAt, PriorState = t.PriorState,
+                    AwakeAt = t.AwakeAt, Failed = t.Failed, FailStatus = t.FailStatus,
                 };
                 stackSources[w] = (info?.Stack, useRequest ? t.RequestTag as TraceCallStack : null);
                 wakes.Add(w);
@@ -173,8 +202,8 @@ static class Analyzer
 
             return new Analysis
             {
-                Start = traceLog.SessionStartTime, End = traceLog.SessionEndTime, Wakes = wakes, Ignored = ignored,
-                InitialState = tracker.InitialState, InitialStateMeasured = tracker.InitialStateMeasured,
+                Start = traceLog.SessionStartTime.ToUniversalTime(), End = traceLog.SessionEndTime.ToUniversalTime(), Wakes = wakes, Ignored = ignored,
+                InitialState = tracker.InitialState, PendingIrps = tracker.PendingIrps, UncertainD0End = tracker.UncertainD0End,
                 InitialD0End = tracker.InitialD0End, TotalEvents = total,
                 EventsLost = traceLog.EventsLost, PowerIrpEvents = powerIrpEvents,
                 DeviceIrps = tracker.DeviceIrps, MissingStateIrps = tracker.MissingStateIrps, MissedWakes = tracker.MissedWakes,

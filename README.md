@@ -9,7 +9,7 @@ in the style of `powercfg /energy`.
 Run `dgpuWakeMonitor.exe` (it asks for administrator rights, which ETW needs). Recording starts right away:
 
 - **events captured / elapsed / wakes / trace size** update live
-- each wake appears in the list immediately (process, PID, DxgKrnl reason, time spent awake)
+- each wake appears once the D0 request completes (process, PID, DxgKrnl reason, time spent awake)
 - the **Log** pane (collapsible) shows what's happening
 - **Stop & build report** stops the trace, analyzes it, and opens `dgpu-wake-report.html`
 
@@ -47,9 +47,12 @@ The signal, checked against real traces on an RTX 5060 Laptop GPU:
 What counts as a wake (`PowerTracker`, shared by the live view and the report):
 
 - The dGPU's D-state is measured *before* tracing starts and saved in `dgpu-wake.meta.json` next to the ETL.
-  Without that file (e.g. a foreign trace), the starting state is inferred from the first request and flagged.
-- A D0 request counts only when the device is not already in D0. Otherwise it is listed under "not counted".
-- If the IRP completes with a failure status, the wake is marked failed and the state is rolled back.
+  Without that file (e.g. a foreign trace), the starting state is unknown.
+- A successful D0 request counts as a wake when the preceding known state was D3.
+  Requests from other states, failures, and requests with missing completions are excluded from the wake count.
+- D0 time starts at a successful D0 completion, or at the start of a recording that began in D0.
+  Successful transitions out of D0 close the interval. If a power-down request is still unresolved at the
+  end of the trace, the report stops measuring the open interval at that request.
 - The DxgKrnl reason is matched by PID and TID, must precede the IRP by at most 250 ms, and is used once.
   The dGPU's adapter context is learned from repeated matches, so a reason is shown as *verified*,
   as an *unverified hint*, or dropped when only another adapter's request is present.

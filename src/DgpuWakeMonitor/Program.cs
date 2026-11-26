@@ -43,7 +43,7 @@ static class Program
             bool symbols = args.Contains("--symbols");
             int initialState = meta != null && string.Equals(meta.InstanceId, device.InstanceId, StringComparison.OrdinalIgnoreCase)
                 ? meta.InitialState : -1;
-            log.WriteLine(meta != null ? $"meta: initial state D{initialState}" : "meta: none (initial state will be inferred)");
+            log.WriteLine(initialState >= 0 ? $"meta: initial state D{initialState}" : "meta: initial state unknown for this device");
             var analysis = Analyzer.Analyze(args[1], device.InstanceId, initialState, symbols, log);
             File.WriteAllText(args[2], Report.Build(analysis, new ReportContext(device, args[1], device.GetPowerState(), symbols)));
             log.WriteLine($"OK: {analysis.CountedWakes.Count()} wakes, {analysis.Wakes.Count(w => w.Failed)} failed, {analysis.Ignored.Count} ignored, {analysis.TotalEvents} events, {analysis.EventsLost} lost, {analysis.DeviceIrps} device IRPs ({analysis.MissingStateIrps} without state), {analysis.PowerIrpEvents} IRP completions");
