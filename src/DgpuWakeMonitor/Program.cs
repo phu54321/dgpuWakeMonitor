@@ -1,4 +1,7 @@
-﻿namespace DgpuWakeMonitor;
+﻿// Copyright (c) 2026 Park Hyunwoo
+// SPDX-License-Identifier: MIT
+
+namespace DgpuWakeMonitor;
 
 static class Program
 {

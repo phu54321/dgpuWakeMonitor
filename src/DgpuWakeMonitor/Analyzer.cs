@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Park Hyunwoo
+// SPDX-License-Identifier: MIT
+
 using Microsoft.Diagnostics.Symbols;
 using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Etlx;

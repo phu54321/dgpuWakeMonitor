@@ -91,3 +91,7 @@ Development build (multiple files under `bin\`):
 ```powershell
 dotnet build src/DgpuWakeMonitor -c Release
 ```
+
+## License
+
+[MIT](LICENSE.txt)

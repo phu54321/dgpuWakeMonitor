@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Park Hyunwoo
+// SPDX-License-Identifier: MIT
+
 using System.Runtime.InteropServices;
 
 namespace DgpuWakeMonitor;
