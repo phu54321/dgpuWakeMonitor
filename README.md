@@ -40,7 +40,23 @@ The signal, checked against real traces on an RTX 5060 Laptop GPU:
 - **Kernel-Power event 7 (`Irp` start)** with `MinorFunction=2` (SET_POWER), `PowerStateType=1` (device),
   `InstanceName` = the dGPU, and `PowerState=0` is the D0 wake request (`3` = back to D3).
   It fires **on the requesting thread**, so its PID/TID is the culprit.
-- **DxgKrnl event 368 (`PowerRequestDuringD3`)** fires on the same thread just before it, with a `Reason` code.
+- **Kernel-Power event 8 (`Irp` stop)** completes that IRP (same `Irp` pointer) with an NTSTATUS.
+- **DxgKrnl event 368 (`PowerRequestDuringD3`)** fires on the same thread just before it, with a `Reason` code
+  and the adapter's context. It also fires for the iGPU.
+
+What counts as a wake (`PowerTracker`, shared by the live view and the report):
+
+- The dGPU's D-state is measured *before* tracing starts and saved in `dgpu-wake.meta.json` next to the ETL.
+  Without that file (e.g. a foreign trace), the starting state is inferred from the first request and flagged.
+- A D0 request counts only when the device is not already in D0. Otherwise it is listed under "not counted".
+- If the IRP completes with a failure status, the wake is marked failed and the state is rolled back.
+- The DxgKrnl reason is matched by PID and TID, must precede the IRP by at most 250 ms, and is used once.
+  The dGPU's adapter context is learned from repeated matches, so a reason is shown as *verified*,
+  as an *unverified hint*, or dropped when only another adapter's request is present.
+- The live view holds events about 3 s so it can process them in time order, because real-time ETW isn't
+  globally ordered.
+- The report warns rather than saying "No dGPU wakes" when events were lost, when Kernel-Power data is missing,
+  or when the dGPU requests lack the `PowerState` field (Kernel-Power event 7 version 0 on older builds).
 
 The report's stacks come from the ETL, because real-time sessions only deliver the kernel half of the stack.
 For example, `nvidia-smi` waking the GPU looks like this:
