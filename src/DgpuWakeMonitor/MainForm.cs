@@ -38,6 +38,7 @@ sealed class MainForm : Form
     int _initialState = -1;
     readonly Dictionary<int, ListViewItem> _liveRows = new();
     bool _busy;
+    bool _closeAfterReport;
 
     public MainForm()
     {
@@ -260,6 +261,7 @@ sealed class MainForm : Form
             _busy = false;
             _start.Enabled = true;
             _timer.Start();
+            if (_closeAfterReport) BeginInvoke(Close);
         }
     }
 
@@ -287,8 +289,37 @@ sealed class MainForm : Form
 
     void OnClosing(object? sender, FormClosingEventArgs e)
     {
-        if (_busy) { e.Cancel = true; SetStatus("Please wait for the analysis to finish."); return; }
-        if (_live != null) Log("Closing: stopping trace without building a report.");
+        // Windows is shutting down / logging off: no prompts, just stop the sessions cleanly.
+        if (e.CloseReason is CloseReason.WindowsShutDown or CloseReason.TaskManagerClosing)
+        {
+            DisposeSessions();
+            return;
+        }
+        if (_busy)
+        {
+            e.Cancel = true;
+            _closeAfterReport = true;
+            SetStatus("Will close when the analysis finishes…");
+            return;
+        }
+        if (_live != null)
+        {
+            var answer = MessageBox.Show(this,
+                "A recording is in progress.\n\nBuild the report before closing?\n\n" +
+                "Yes: stop, build and open the report, then close.\n" +
+                "No: close now (the raw .etl trace is kept, no report).\n" +
+                "Cancel: keep recording.",
+                "dgpuWakeMonitor", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question, MessageBoxDefaultButton.Button1);
+            if (answer == DialogResult.Cancel) { e.Cancel = true; return; }
+            if (answer == DialogResult.Yes)
+            {
+                e.Cancel = true;
+                _closeAfterReport = true;
+                _ = StopRecordingAsync();
+                return;
+            }
+            Log("Closing: stopping trace without building a report.");
+        }
         DisposeSessions();
     }
 
