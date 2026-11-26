@@ -1,0 +1,24 @@
+# Build output
+bin/
+obj/
+publish/
+*.nupkg
+
+# Traces and reports produced while testing
+*.etl
+*.etlx
+dgpu-wake-report.html
+
+# IDE / tooling
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.rsuser
+*.DotSettings.user
+launchSettings.json
+
+# OS
+Thumbs.db
+Desktop.ini
