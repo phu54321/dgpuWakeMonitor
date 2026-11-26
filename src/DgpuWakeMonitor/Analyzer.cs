@@ -19,6 +19,7 @@ public sealed class WakeRecord
     public string? ImagePath { get; init; }
     public string? CommandLine { get; init; }
     public int? Reason { get; set; }
+    public RequestMatch ReasonMatch { get; init; }
     public DateTime? SleptAt { get; set; }
     public List<StackFrame> Stack { get; set; } = [];
     /// <summary>First user-mode module below the kernel thunks (e.g. nvml.dll, dxgi.dll, nvapi64.dll).</summary>
@@ -116,15 +117,17 @@ static class Analyzer
             foreach (var t in tracker.Wakes)
             {
                 var info = t.IrpTag as IrpInfo;
+                var match = tracker.MatchQuality(t);
+                bool useRequest = match is RequestMatch.Verified or RequestMatch.Unverified;
                 var w = new WakeRecord
                 {
                     Time = t.Time, Pid = t.Pid, Tid = t.Tid,
                     ProcessName = info?.Name ?? NameFor(t.Pid, null),
                     ImagePath = info?.Image, CommandLine = info?.CommandLine,
-                    Reason = t.Reason, SleptAt = t.SleptAt, PriorStateKnown = t.PriorStateKnown,
+                    Reason = useRequest ? t.Reason : null, ReasonMatch = match, SleptAt = t.SleptAt, PriorStateKnown = t.PriorStateKnown,
                     Completed = t.Completed, Failed = t.Failed, FailStatus = t.FailStatus,
                 };
-                stackSources[w] = (info?.Stack, t.RequestTag as TraceCallStack);
+                stackSources[w] = (info?.Stack, useRequest ? t.RequestTag as TraceCallStack : null);
                 wakes.Add(w);
             }
             var ignored = tracker.Ignored

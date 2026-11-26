@@ -137,7 +137,13 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
             if (!w.Failed && !w.Completed) Row(sb, "Completion", "<span style=\"color:var(--muted)\">IRP completion not seen in the trace</span>");
             Row(sb, "Entry module", w.EntryModule != null ? $"<span class=\"mono\">{H(w.EntryModule)}</span>" : "<span style=\"color:var(--muted)\">no user-mode frames</span>");
             if (w.CallerModule != null) Row(sb, "Caller module", $"<span class=\"mono\">{H(w.CallerModule)}</span>");
-            Row(sb, "DxgKrnl reason", w.Reason?.ToString() ?? "<span style=\"color:var(--muted)\">no PowerRequestDuringD3 on this thread</span>");
+            Row(sb, "DxgKrnl reason", w.ReasonMatch switch
+            {
+                RequestMatch.Verified => $"{w.Reason}",
+                RequestMatch.Unverified => $"{w.Reason} <span class=\"tag\">hint · adapter not verified</span>",
+                RequestMatch.OtherAdapter => "<span style=\"color:var(--muted)\">only a request for another adapter on this thread; not used</span>",
+                _ => "<span style=\"color:var(--muted)\">no preceding PowerRequestDuringD3 on this thread</span>",
+            });
             sb.Append("</table>");
 
             var user = w.Stack.Where(f => !f.IsKernel).ToList();
