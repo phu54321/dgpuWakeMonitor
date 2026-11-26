@@ -225,8 +225,6 @@ sealed class Recorder : IDisposable
             new TraceEventProviderOptions { EventIDStacksToEnable = [Etw.IrpStartId] });
     }
 
-    public int EventsLost => _session.EventsLost;
-
     public long FileSize { get { try { return new FileInfo(EtlPath).Length; } catch { return 0; } } }
 
     public void Stop()

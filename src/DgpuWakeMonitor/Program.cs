@@ -45,8 +45,9 @@ static class Program
                 ? meta.InitialState : -1;
             log.WriteLine(meta != null ? $"meta: initial state D{initialState}" : "meta: none (initial state will be inferred)");
             var analysis = Analyzer.Analyze(args[1], device.InstanceId, initialState, symbols, log);
-            File.WriteAllText(args[2], Report.Build(analysis, new ReportContext(device, args[1], 0, device.GetPowerState(), symbols)));
-            log.WriteLine($"OK: {analysis.CountedWakes.Count()} wakes, {analysis.Wakes.Count(w => w.Failed)} failed, {analysis.Ignored.Count} ignored, {analysis.TotalEvents} events");
+            File.WriteAllText(args[2], Report.Build(analysis, new ReportContext(device, args[1], device.GetPowerState(), symbols)));
+            log.WriteLine($"OK: {analysis.CountedWakes.Count()} wakes, {analysis.Wakes.Count(w => w.Failed)} failed, {analysis.Ignored.Count} ignored, {analysis.TotalEvents} events, {analysis.EventsLost} lost, {analysis.DeviceIrps} device IRPs ({analysis.MissingStateIrps} without state), {analysis.PowerIrpEvents} IRP completions");
+            foreach (var c in analysis.Caveats) log.WriteLine($"WARNING: {c}");
             return 0;
         }
         catch (Exception ex) { log.WriteLine(ex); return 1; }

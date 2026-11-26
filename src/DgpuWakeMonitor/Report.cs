@@ -4,7 +4,7 @@ using System.Text;
 
 namespace DgpuWakeMonitor;
 
-public sealed record ReportContext(GpuDevice Device, string EtlPath, int EventsLost, int? StateAtEnd, bool SymbolsResolved);
+public sealed record ReportContext(GpuDevice Device, string EtlPath, int? StateAtEnd, bool SymbolsResolved);
 
 static class Report
 {
@@ -26,9 +26,9 @@ static class Report
 <title>dGPU Wake Report</title>
 <style>
 :root{--bg:#f6f7f9;--card:#fff;--ink:#1d2330;--muted:#5d6675;--line:#e2e5ea;--accent:#2f6fde;
---bad:#c8382f;--bad-bg:#fdeeed;--good:#1f8a4c;--good-bg:#e9f6ef;--d0:#e0553d;--d3:#dfe3e8;--mono:ui-monospace,"Cascadia Mono",Consolas,monospace}
+--bad:#c8382f;--bad-bg:#fdeeed;--good:#1f8a4c;--good-bg:#e9f6ef;--warn:#b7791f;--warn-bg:#fdf6e7;--d0:#e0553d;--d3:#dfe3e8;--mono:ui-monospace,"Cascadia Mono",Consolas,monospace}
 @media (prefers-color-scheme:dark){:root{--bg:#121418;--card:#1b1e24;--ink:#e6e8ec;--muted:#9aa3b2;--line:#2c3038;--accent:#6ea0ff;
---bad:#ff7a70;--bad-bg:#3a1f1e;--good:#5fd394;--good-bg:#173323;--d0:#ff6b50;--d3:#2f343d;color-scheme:dark}}
+--bad:#ff7a70;--bad-bg:#3a1f1e;--good:#5fd394;--good-bg:#173323;--warn:#f0b85a;--warn-bg:#352a14;--d0:#ff6b50;--d3:#2f343d;color-scheme:dark}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 "Segoe UI",system-ui,sans-serif}
 main{max-width:1040px;margin:0 auto;padding:32px 20px 64px}
@@ -46,6 +46,8 @@ tr:last-child td{border-bottom:none}
 .verdict{border-radius:10px;padding:16px 18px;margin-bottom:14px;border:1px solid}
 .verdict.bad{background:var(--bad-bg);border-color:var(--bad);color:var(--ink)}
 .verdict.good{background:var(--good-bg);border-color:var(--good)}
+.verdict.warn{background:var(--warn-bg);border-color:var(--warn)}
+.verdict ul{margin:6px 0 0;padding-left:20px}
 .verdict b{font-size:18px}
 .stats{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px}
 .stat{flex:1 1 150px;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
@@ -75,9 +77,19 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
 
         var counted = a.CountedWakes.ToList();
 
-        // Verdict
+        // Verdict: only claim "no wakes" when the trace could have shown them.
+        var caveats = a.Caveats.ToList();
+        if (caveats.Count > 0)
+        {
+            sb.Append($"<div class=\"verdict warn\"><b>{(counted.Count == 0 ? "No wakes found, but the trace is incomplete" : "Results may be incomplete")}</b><ul>");
+            foreach (var c in caveats) sb.Append($"<li>{H(c)}</li>");
+            sb.Append("</ul></div>");
+        }
         if (counted.Count == 0)
-            sb.Append($"""<div class="verdict good"><b>No dGPU wakes</b><div>The discrete GPU was not woken during the {Dur(a.Duration)} recording.</div></div>""");
+        {
+            if (caveats.Count == 0)
+                sb.Append($"""<div class="verdict good"><b>No dGPU wakes</b><div>{(a.DeviceIrps == 0 ? "No power requests for the discrete GPU" : "No D3 → D0 transition of the discrete GPU")} during the {Dur(a.Duration)} recording.</div></div>""");
+        }
         else
         {
             var top = counted.GroupBy(w => w.ProcessName).OrderByDescending(g => g.Count()).First();
@@ -182,7 +194,8 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
         Row(sb, "State at start", State(a.InitialState) + (a.InitialState < 0 ? "" : a.InitialStateMeasured ? " · measured" : " · inferred from the first request"));
         Row(sb, "State at end", State(ctx.StateAtEnd));
         Row(sb, "Events in trace", a.TotalEvents.ToString("N0"));
-        Row(sb, "Events lost", ctx.EventsLost == 0 ? "0" : $"<b style=\"color:var(--bad)\">{ctx.EventsLost:N0}</b>");
+        Row(sb, "Events lost", a.EventsLost == 0 ? "0" : $"<b style=\"color:var(--bad)\">{a.EventsLost:N0}</b>");
+        Row(sb, "dGPU power requests", $"{a.DeviceIrps:N0}{(a.MissingStateIrps > 0 ? $" ({a.MissingStateIrps:N0} without PowerState)" : "")} · {a.PowerIrpEvents:N0} Kernel-Power IRP completions (all devices)");
         Row(sb, "Symbols", ctx.SymbolsResolved ? "resolved" : "module+offset only (tick <i>Resolve symbols</i> before stopping to resolve Windows frames)");
         Row(sb, "Trace file", File.Exists(ctx.EtlPath) ? $"<span class=\"mono\">{H(ctx.EtlPath)}</span>" : "deleted");
         sb.Append("</table></div>");

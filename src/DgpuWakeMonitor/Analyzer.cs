@@ -51,7 +51,25 @@ public sealed class Analysis
     public bool InitialStateMeasured { get; init; }
     public DateTime? InitialD0End { get; init; }
     public long TotalEvents { get; init; }
+    /// <summary>Events ETW dropped, from the finalized trace.</summary>
+    public int EventsLost { get; init; }
+    /// <summary>Kernel-Power IRP completions for any device: zero means the provider data is missing.</summary>
+    public int PowerIrpEvents { get; init; }
+    /// <summary>SET_POWER IRPs for the dGPU, and how many of them lacked the PowerState field.</summary>
+    public int DeviceIrps { get; init; }
+    public int MissingStateIrps { get; init; }
     public TimeSpan Duration => End - Start;
+
+    /// <summary>Reasons the wake list may be incomplete; empty when the trace is fully usable.</summary>
+    public IEnumerable<string> Caveats
+    {
+        get
+        {
+            if (EventsLost > 0) yield return $"ETW dropped {EventsLost:N0} events while recording, so wakes may be missing.";
+            if (PowerIrpEvents == 0) yield return "The trace contains no Kernel-Power IRP events at all, so power transitions could not be observed.";
+            if (MissingStateIrps > 0) yield return $"{MissingStateIrps} of {DeviceIrps} dGPU power requests have no PowerState field (Kernel-Power event 7 version 0, older Windows builds) and could not be classified.";
+        }
+    }
     public IEnumerable<WakeRecord> CountedWakes => Wakes.Where(w => !w.Failed);
 
     /// <summary>D0 intervals inside the recording window (open intervals run to the end).</summary>
@@ -94,6 +112,7 @@ static class Analyzer
         {
             var tracker = new PowerTracker(initialState);
             long total = 0;
+            int powerIrpEvents = 0;
 
             // TraceEvent objects are reused across iterations, so never keep one: the tagger copies what
             // we need (including call stacks, which are stable indexes into the log) while it is current.
@@ -109,7 +128,11 @@ static class Analyzer
             foreach (var e in traceLog.Events)
             {
                 total++;
-                if (Etw.Parse(e, instanceId, Tag) is { } pe) tracker.Process(pe);
+                if (Etw.Parse(e, instanceId, Tag) is { } pe)
+                {
+                    if (pe.Kind == PowerEvtKind.IrpStop) powerIrpEvents++;
+                    tracker.Process(pe);
+                }
             }
 
             var wakes = new List<WakeRecord>();
@@ -151,6 +174,8 @@ static class Analyzer
                 Start = traceLog.SessionStartTime, End = traceLog.SessionEndTime, Wakes = wakes, Ignored = ignored,
                 InitialState = tracker.InitialState, InitialStateMeasured = tracker.InitialStateMeasured,
                 InitialD0End = tracker.InitialD0End, TotalEvents = total,
+                EventsLost = traceLog.EventsLost, PowerIrpEvents = powerIrpEvents,
+                DeviceIrps = tracker.DeviceIrps, MissingStateIrps = tracker.MissingStateIrps,
             };
         }
         finally

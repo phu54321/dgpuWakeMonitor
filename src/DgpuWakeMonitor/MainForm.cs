@@ -223,7 +223,6 @@ sealed class MainForm : Form
         _busy = true;
         _stop.Enabled = false;
         var recorder = _recorder;
-        int lost = recorder.EventsLost;
         Log("Stopping trace…");
         DisposeSessions();
         _timer.Stop();
@@ -240,11 +239,12 @@ sealed class MainForm : Form
             var (analysis, html) = await Task.Run(() =>
             {
                 var a = Analyzer.Analyze(recorder.EtlPath, device.InstanceId, initialState, symbols, uiLog);
-                return (a, Report.Build(a, new ReportContext(device, recorder.EtlPath, lost, device.GetPowerState(), symbols)));
+                return (a, Report.Build(a, new ReportContext(device, recorder.EtlPath, device.GetPowerState(), symbols)));
             });
             _reportPath = Path.Combine(_runDir!, "dgpu-wake-report.html");
             await File.WriteAllTextAsync(_reportPath, html);
-            Log($"Analyzed {analysis.TotalEvents:N0} trace events in {sw.Elapsed.TotalSeconds:0.0} s: {analysis.CountedWakes.Count()} wake(s){(analysis.Ignored.Count > 0 ? $", {analysis.Ignored.Count} D0 request(s) not counted" : "")}{(lost > 0 ? $", {lost:N0} events LOST" : "")}.");
+            Log($"Analyzed {analysis.TotalEvents:N0} trace events in {sw.Elapsed.TotalSeconds:0.0} s: {analysis.CountedWakes.Count()} wake(s){(analysis.Ignored.Count > 0 ? $", {analysis.Ignored.Count} D0 request(s) not counted" : "")}{(analysis.EventsLost > 0 ? $", {analysis.EventsLost:N0} events LOST" : "")}.");
+            foreach (var c in analysis.Caveats) Log($"  WARNING: {c}");
             Log($"Report → {_reportPath}");
             ShowAnalysis(analysis);
             _openReport.Enabled = true;

@@ -85,6 +85,10 @@ public sealed class PowerTracker
     public List<TrackedWake> Wakes { get; } = new();
     public List<IgnoredRequest> Ignored { get; } = new();
     public int CountedWakes => Wakes.Count(w => !w.Failed);
+    /// <summary>SET_POWER IRPs seen for the device.</summary>
+    public int DeviceIrps { get; private set; }
+    /// <summary>Device IRPs without a PowerState field (Kernel-Power event 7 v0): cannot be classified.</summary>
+    public int MissingStateIrps { get; private set; }
 
     public event Action<TrackedWake>? WakeStarted;
     public event Action<TrackedWake>? WakeEnded;
@@ -103,7 +107,8 @@ public sealed class PowerTracker
 
     void OnIrpStart(in PowerEvt e)
     {
-        if (e.State < 0) return;
+        DeviceIrps++;
+        if (e.State < 0) { MissingStateIrps++; return; }
         int prev = _state;
         if (InitialState < 0) InitialState = e.State == 0 ? 3 : 0; // best guess: a request implies a change
 
