@@ -35,11 +35,27 @@ static class Program
         {
             // The recording's sidecar knows the device and its state when tracing started.
             var meta = RecordingMeta.TryLoad(args[1]);
+            var sidecarDevice = meta != null ? new GpuDevice(meta.InstanceId, meta.DeviceName) : null;
+            var adapters = GpuDevice.Enumerate();
             int di = Array.IndexOf(args, "--device");
-            var match = di > 0 && di + 1 < args.Length ? args[di + 1] : meta?.InstanceId;
-            var device = GpuDevice.Pick(GpuDevice.Enumerate(), match)
-                         ?? (meta != null ? new GpuDevice(meta.InstanceId, meta.DeviceName) : null)
+            GpuDevice device;
+            if (di > 0)
+            {
+                // An explicit selector must match; never silently fall back to another GPU.
+                if (di + 1 >= args.Length) throw new ArgumentException("--device needs a value (name or instance-id substring).");
+                var sel = args[di + 1];
+                device = GpuDevice.Pick(adapters, sel)
+                    ?? (sidecarDevice != null && GpuDevice.Pick([sidecarDevice], sel) != null ? sidecarDevice : null)
+                    ?? throw new ArgumentException($"--device \"{sel}\" matches no display adapter. Available: "
+                        + string.Join("; ", adapters.Append(sidecarDevice).OfType<GpuDevice>().DistinctBy(g => g.InstanceId)
+                            .Select(g => $"{g.Name} ({g.InstanceId})")));
+            }
+            else
+            {
+                // The sidecar names the recorded device even if it is not present on this machine.
+                device = (meta != null ? GpuDevice.Pick(adapters, meta.InstanceId) ?? sidecarDevice : GpuDevice.Pick(adapters, null))
                          ?? throw new InvalidOperationException("No discrete GPU found.");
+            }
             bool symbols = args.Contains("--symbols");
             int initialState = meta != null && string.Equals(meta.InstanceId, device.InstanceId, StringComparison.OrdinalIgnoreCase)
                 ? meta.InitialState : -1;
@@ -50,6 +66,7 @@ static class Program
             foreach (var c in analysis.Caveats) log.WriteLine($"WARNING: {c}");
             return 0;
         }
+        catch (ArgumentException ex) { log.WriteLine($"ERROR: {ex.Message}"); return 2; }
         catch (Exception ex) { log.WriteLine(ex); return 1; }
         finally { log.Dispose(); }
     }
