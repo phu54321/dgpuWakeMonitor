@@ -119,6 +119,8 @@ sealed class LiveMonitor : IDisposable
     public event Action<int, DateTime, TimeSpan>? Sleep;
     /// <summary>The D0 request for this wake failed (status); it is no longer counted.</summary>
     public event Action<int, uint>? WakeFailed;
+    /// <summary>The device went to low power without a captured D0 request: a wake was missed.</summary>
+    public event Action<DateTime>? WakeMissed;
     /// <summary>A D0 request that did not count as a wake (time, process, why).</summary>
     public event Action<DateTime, string, string>? Ignored;
     /// <summary>The process name shown for these wake ids was wrong or a guess; this is the better name.</summary>
@@ -135,6 +137,7 @@ sealed class LiveMonitor : IDisposable
         _tracker.WakeStarted += w => Wake?.Invoke(new LiveWake(w.Id, w.Time, w.Pid, w.Tid, Track(w.Id, w.Pid, w.Time), w.Reason, w.PriorStateKnown));
         _tracker.WakeEnded += w => Sleep?.Invoke(w.Id, w.SleptAt!.Value, w.SleptAt.Value - w.Time);
         _tracker.WakeFailed += w => WakeFailed?.Invoke(w.Id, w.FailStatus ?? 0);
+        _tracker.WakeMissed += t => WakeMissed?.Invoke(t);
         _tracker.RequestIgnored += r => Ignored?.Invoke(r.Time, NameAt(r.Pid, r.Time, Guess(r.Pid)), r.Why);
 
         _session = new TraceEventSession(Etw.LiveSessionName) { StopOnDispose = true };

@@ -58,6 +58,7 @@ public sealed class Analysis
     /// <summary>SET_POWER IRPs for the dGPU, and how many of them lacked the PowerState field.</summary>
     public int DeviceIrps { get; init; }
     public int MissingStateIrps { get; init; }
+    public int MissedWakes { get; init; }
     public TimeSpan Duration => End - Start;
 
     /// <summary>Reasons the wake list may be incomplete; empty when the trace is fully usable.</summary>
@@ -67,6 +68,7 @@ public sealed class Analysis
         {
             if (EventsLost > 0) yield return $"ETW dropped {EventsLost:N0} events while recording, so wakes may be missing.";
             if (PowerIrpEvents == 0) yield return "The trace contains no Kernel-Power IRP events at all, so power transitions could not be observed.";
+            if (MissedWakes > 0) yield return $"The dGPU went back to D3 {MissedWakes} time(s) without a captured D0 request, so a wake was missed (typically one that happened while tracing was still starting).";
             if (MissingStateIrps > 0) yield return $"{MissingStateIrps} of {DeviceIrps} dGPU power requests have no PowerState field (Kernel-Power event 7 version 0, older Windows builds) and could not be classified.";
         }
     }
@@ -175,7 +177,7 @@ static class Analyzer
                 InitialState = tracker.InitialState, InitialStateMeasured = tracker.InitialStateMeasured,
                 InitialD0End = tracker.InitialD0End, TotalEvents = total,
                 EventsLost = traceLog.EventsLost, PowerIrpEvents = powerIrpEvents,
-                DeviceIrps = tracker.DeviceIrps, MissingStateIrps = tracker.MissingStateIrps,
+                DeviceIrps = tracker.DeviceIrps, MissingStateIrps = tracker.MissingStateIrps, MissedWakes = tracker.MissedWakes,
             };
         }
         finally

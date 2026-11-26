@@ -165,6 +165,7 @@ sealed class MainForm : Form
 
             // Measure the state *before* tracing starts so the first D0 request can be classified.
             _initialState = _device.GetPowerState();
+            var startup = Stopwatch.StartNew();
             var etlPath = Path.Combine(_runDir, "dgpu-wake.etl");
             new RecordingMeta(_device.InstanceId, _device.Name, _initialState, DateTime.Now).Save(etlPath);
 
@@ -173,6 +174,7 @@ sealed class MainForm : Form
             _live.Wake += w => BeginInvoke(() => OnLiveWake(w));
             _live.Sleep += (id, t, d) => BeginInvoke(() => OnLiveSleep(id, t, d));
             _live.WakeFailed += (id, status) => BeginInvoke(() => OnLiveWakeFailed(id, status));
+            _live.WakeMissed += t => BeginInvoke(() => Log($"[{t.ToLocalTime():HH:mm:ss.fff}] SLEEP D0→D3 without a captured wake: a wake was missed (likely while tracing was starting)"));
             _live.Ignored += (t, proc, why) => BeginInvoke(() => Log($"[{t.ToLocalTime():HH:mm:ss.fff}] D0 request from {proc} not counted: {why}"));
             _live.NameResolved += (ids, name) => BeginInvoke(() =>
             {
@@ -188,8 +190,11 @@ sealed class MainForm : Form
 
             _start.Enabled = false;
             _stop.Enabled = true;
-            Log($"Recording started → {_recorder.EtlPath}");
+            Log($"Recording started in {startup.Elapsed.TotalSeconds:0.0} s → {_recorder.EtlPath}");
             Log($"dGPU was {StateName(_initialState)} when recording started. Waiting for wakes… (press Stop to build the report)");
+            int afterStart = _device.GetPowerState();
+            if (afterStart != _initialState)
+                Log($"  note: dGPU changed to {StateName(afterStart)} while tracing was starting; that transition may not be in the trace.");
             Log("Live view runs ~3 s behind so events can be put in order.");
         }
         catch (Exception ex)

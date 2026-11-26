@@ -89,6 +89,12 @@ public sealed class PowerTracker
     public int DeviceIrps { get; private set; }
     /// <summary>Device IRPs without a PowerState field (Kernel-Power event 7 v0): cannot be classified.</summary>
     public int MissingStateIrps { get; private set; }
+    /// <summary>
+    /// Low-power requests while the device was already believed to be in low power: the D0 request in
+    /// between was not captured (typically a wake while tracing was still starting).
+    /// </summary>
+    public int MissedWakes { get; private set; }
+    public event Action<DateTime>? WakeMissed;
 
     public event Action<TrackedWake>? WakeStarted;
     public event Action<TrackedWake>? WakeEnded;
@@ -136,7 +142,14 @@ public sealed class PowerTracker
         }
         else
         {
-            if (prev > 0) { _pending[e.Irp] = new Pending(prev, null, null, false); _state = e.State; return; }
+            if (prev > 0)
+            {
+                MissedWakes++;
+                WakeMissed?.Invoke(e.Time);
+                _pending[e.Irp] = new Pending(prev, null, null, false);
+                _state = e.State;
+                return;
+            }
             TrackedWake? closed = null;
             bool closedInitial = false;
             if (_open != null)
