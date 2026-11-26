@@ -81,7 +81,9 @@ static class Analyzer
         try
         {
             var wakes = new List<WakeRecord>();
-            var lastRequest = new Dictionary<int, (DateTime time, int reason, TraceEvent ev)>();
+            // TraceEvent objects are reused across iterations, so never keep one: take what we need
+            // (including the call stack, which is a stable index into the log) while it is current.
+            var lastRequest = new Dictionary<int, (DateTime time, int reason, TraceCallStack? stack)>();
             var stackSources = new Dictionary<WakeRecord, (TraceCallStack? irp, TraceCallStack? req)>();
             WakeRecord? open = null;
             int? initialState = null;
@@ -93,7 +95,7 @@ static class Analyzer
                 total++;
                 if (Etw.IsPowerRequestDuringD3(e))
                 {
-                    lastRequest[e.ThreadID] = (e.TimeStamp, Convert.ToInt32(e.PayloadByName("Reason") ?? 0), e);
+                    lastRequest[e.ThreadID] = (e.TimeStamp, Convert.ToInt32(e.PayloadByName("Reason") ?? 0), e.CallStack());
                     continue;
                 }
                 int state = Etw.TryGetDevicePowerIrp(e, instanceId);
@@ -114,7 +116,7 @@ static class Analyzer
                     if (lastRequest.TryGetValue(e.ThreadID, out var r) && (e.TimeStamp - r.time).TotalMilliseconds < 250)
                     {
                         w.Reason = r.reason;
-                        reqStack = r.ev.CallStack();
+                        reqStack = r.stack;
                     }
                     stackSources[w] = (e.CallStack(), reqStack);
                     wakes.Add(w);
