@@ -42,7 +42,9 @@ sealed class MainForm : Form
         // Fonts (in points) follow the monitor DPI and AutoSize controls size from them;
         // only the few fixed pixel sizes are scaled by hand.
         AutoScaleMode = AutoScaleMode.None;
-        Text = "dGPU Wake Monitor";
+        Text = "dgpuWakeMonitor";
+        using (var ico = typeof(MainForm).Assembly.GetManifestResourceStream("DgpuWakeMonitor.icon.ico"))
+            if (ico != null) Icon = new Icon(ico);
         Font = new Font("Segoe UI", 9.5f);
         ClientSize = new Size(LogicalToDeviceUnits(980), LogicalToDeviceUnits(680));
         MinimumSize = new Size(LogicalToDeviceUnits(640), LogicalToDeviceUnits(480));

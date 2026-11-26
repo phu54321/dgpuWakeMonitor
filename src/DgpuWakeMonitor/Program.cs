@@ -5,7 +5,7 @@ static class Program
     [STAThread]
     static int Main(string[] args)
     {
-        // Headless re-analysis of an existing trace: dgpuwake --analyze <trace.etl> <report.html> [--symbols] [--device <match>]
+        // Headless re-analysis of an existing trace: dgpuWakeMonitor --analyze <trace.etl> <report.html> [--symbols] [--device <match>]
         if (args.Length >= 3 && args[0] == "--analyze")
             return AnalyzeHeadless(args);
 
@@ -25,7 +25,7 @@ static class Program
         Directory.CreateDirectory(dir);
         var path = Path.Combine(dir, "crash.log");
         File.AppendAllText(path, $"[{DateTime.Now:O}] {ex}\n\n");
-        MessageBox.Show($"{ex?.Message}\n\nDetails written to {path}", "dGPU Wake Monitor error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        MessageBox.Show($"{ex?.Message}\n\nDetails written to {path}", "dgpuWakeMonitor error", MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 
     static int AnalyzeHeadless(string[] args)

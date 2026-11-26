@@ -1,4 +1,4 @@
-# dGPU Wake Monitor
+# dgpuWakeMonitor
 
 Finds out **which process woke the discrete GPU** (D3 → D0) on hybrid-graphics laptops.
 It records the same ETW data you'd capture with WPR, inside the app, and turns it into an HTML report
@@ -6,7 +6,7 @@ in the style of `powercfg /energy`.
 
 ## Usage
 
-Run `dgpuwake.exe` (it asks for administrator rights, which ETW needs). Recording starts right away:
+Run `dgpuWakeMonitor.exe` (it asks for administrator rights, which ETW needs). Recording starts right away:
 
 - **events captured / elapsed / wakes / trace size** update live
 - each wake appears in the list immediately (process, PID, DxgKrnl reason, time spent awake)
@@ -23,7 +23,7 @@ NVIDIA user-mode DLLs have no public symbols, so they stay as `module+offset`.
 Re-analyze an existing trace without the GUI:
 
 ```powershell
-dgpuwake --analyze <trace.etl> <report.html> [--symbols] [--device <name or instance-id substring>]
+dgpuWakeMonitor --analyze <trace.etl> <report.html> [--symbols] [--device <name or instance-id substring>]
 ```
 
 ## How it works
@@ -56,7 +56,7 @@ The current D-state shown in the header is read from `DEVPKEY_Device_PowerData`,
 
 Requires the .NET 9 SDK and Windows 10/11 x64.
 
-Single-file executable (recommended): produces `publish\dgpuwake.exe`, about 7.6 MB:
+Single-file executable (recommended): produces `publish\dgpuWakeMonitor.exe`, about 7.8 MB:
 
 ```powershell
 dotnet publish src/DgpuWakeMonitor -c Release -o publish

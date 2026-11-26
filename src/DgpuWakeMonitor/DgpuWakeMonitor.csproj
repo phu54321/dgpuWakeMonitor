@@ -10,11 +10,17 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <AssemblyName>dgpuwake</AssemblyName>
+    <AssemblyName>dgpuWakeMonitor</AssemblyName>
     <RootNamespace>DgpuWakeMonitor</RootNamespace>
+    <ApplicationIcon>Assets\icon.ico</ApplicationIcon>
   </PropertyGroup>
 
-  <!-- `dotnet publish` produces a single dgpuwake.exe (needs the .NET 9 Desktop Runtime).
+  <ItemGroup>
+    <!-- Same .ico embedded for the window/taskbar icon; Assets\icon.svg is the editable source. -->
+    <EmbeddedResource Include="Assets\icon.ico" LogicalName="DgpuWakeMonitor.icon.ico" />
+  </ItemGroup>
+
+  <!-- `dotnet publish` produces a single dgpuWakeMonitor.exe (needs the .NET 9 Desktop Runtime).
        IncludeAllContentForSelfExtract bundles TraceEvent's amd64\*.dll (msdia140, KernelTraceControl),
        which it loads from disk; without it symbol resolution silently fails. -->
   <PropertyGroup>
