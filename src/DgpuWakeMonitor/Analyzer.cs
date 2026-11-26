@@ -64,8 +64,20 @@ static class Analyzer
 
     public static Analysis Analyze(string etlPath, string instanceId, bool resolveSymbols, TextWriter log)
     {
-        var etlxPath = Path.ChangeExtension(etlPath, ".etlx");
-        var traceLog = TraceLog.OpenOrConvert(etlPath, new TraceLogOptions { KeepAllEvents = false, ConversionLog = TextWriter.Null });
+        // Convert into a temp file this analysis owns. OpenOrConvert would reuse (and we'd then delete)
+        // a sibling .etlx that might belong to the user, e.g. from PerfView.
+        var etlxPath = Path.Combine(Path.GetTempPath(), $"dgpuWakeMonitor-{Guid.NewGuid():N}.etlx");
+        TraceLog traceLog;
+        try
+        {
+            TraceLog.CreateFromEventTraceLogFile(etlPath, etlxPath, new TraceLogOptions { ConversionLog = TextWriter.Null });
+            traceLog = new TraceLog(etlxPath);
+        }
+        catch
+        {
+            try { File.Delete(etlxPath); } catch { }
+            throw;
+        }
         try
         {
             var wakes = new List<WakeRecord>();
