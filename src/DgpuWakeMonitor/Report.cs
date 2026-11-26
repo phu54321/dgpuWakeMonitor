@@ -73,18 +73,20 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
 """);
         sb.Append($"<p class=\"sub\">Which processes brought the discrete GPU out of D3 (sleep) into D0 (awake). Generated {H(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"))}.</p>");
 
+        var counted = a.CountedWakes.ToList();
+
         // Verdict
-        if (a.Wakes.Count == 0)
+        if (counted.Count == 0)
             sb.Append($"""<div class="verdict good"><b>No dGPU wakes</b><div>The discrete GPU was not woken during the {Dur(a.Duration)} recording.</div></div>""");
         else
         {
-            var top = a.Wakes.GroupBy(w => w.ProcessName).OrderByDescending(g => g.Count()).First();
-            var plural = a.Wakes.Count == 1 ? "" : "s";
-            sb.Append($"<div class=\"verdict bad\"><b>{a.Wakes.Count} dGPU wake{plural}</b><div>Most frequent culprit: <b>{H(top.Key)}</b> ({top.Count()}×). The dGPU was awake {pct:0.0}% of the recording.</div></div>");
+            var top = counted.GroupBy(w => w.ProcessName).OrderByDescending(g => g.Count()).First();
+            var plural = counted.Count == 1 ? "" : "s";
+            sb.Append($"<div class=\"verdict bad\"><b>{counted.Count} dGPU wake{plural}</b><div>Most frequent culprit: <b>{H(top.Key)}</b> ({top.Count()}×). The dGPU was awake {pct:0.0}% of the recording.</div></div>");
         }
 
         sb.Append("<div class=\"stats\">");
-        Stat(sb, a.Wakes.Count.ToString(), "wakes (D3 → D0)");
+        Stat(sb, counted.Count.ToString(), "wakes (D3 → D0)");
         Stat(sb, Dur(a.TimeInD0), "time in D0");
         Stat(sb, $"{pct:0.0}%", "D0 residency");
         Stat(sb, Dur(a.Duration), "recording length");
@@ -97,16 +99,16 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
             double l = (from - a.Start).TotalMilliseconds / total * 100, wd = (to - from).TotalMilliseconds / total * 100;
             sb.Append(CultureInfo.InvariantCulture, $"<span style=\"left:{l:0.###}%;width:{wd:0.###}%\" title=\"{H(title)}\"></span>");
         }
-        if (a.InitialState == 0) Seg(a.Start, a.FirstSleepBeforeFirstWake ?? (a.Wakes.FirstOrDefault()?.Time ?? a.End), "D0 at start of recording");
-        foreach (var w in a.Wakes) Seg(w.Time, w.SleptAt ?? a.End, $"{w.ProcessName} · {Ts(w.Time)} · {Dur((w.SleptAt ?? a.End) - w.Time)}");
+        foreach (var (from, to, w) in a.D0Intervals)
+            Seg(from, to, w == null ? "D0 at start of recording" : $"{w.ProcessName} · {Ts(w.Time)} · {Dur(to - from)}");
         sb.Append($"</div><div class=\"axis\"><span>{Ts(a.Start)}</span><span>{Ts(a.Start + a.Duration / 2)}</span><span>{Ts(a.End)}</span></div>");
         sb.Append("<div class=\"legend\"><i style=\"background:var(--d0)\"></i>D0 awake<i style=\"background:var(--d3)\"></i>D3 asleep / idle</div></div>");
 
         // Culprits
-        if (a.Wakes.Count > 0)
+        if (counted.Count > 0)
         {
             sb.Append("<h2>Culprits</h2><div class=\"card scroll\"><table><tr><th>Process</th><th class=\"num\">Wakes</th><th class=\"num\">Time in D0</th><th>Entry module</th><th>Caller module</th></tr>");
-            foreach (var g in a.Wakes.GroupBy(w => w.ProcessName).OrderByDescending(g => g.Count()).ThenBy(g => g.Key))
+            foreach (var g in counted.GroupBy(w => w.ProcessName).OrderByDescending(g => g.Count()).ThenBy(g => g.Key))
             {
                 var d0 = TimeSpan.FromTicks(g.Sum(w => ((w.SleptAt ?? a.End) - w.Time).Ticks));
                 string mods(Func<WakeRecord, string?> f) => H(string.Join(", ", g.Select(f).Where(m => m != null).Distinct()));
@@ -121,14 +123,18 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
         foreach (var w in a.Wakes)
         {
             i++;
-            sb.Append($"<div class=\"card wake{(w.KernelInitiated ? " sys" : "")}\"><h3>#{i} · {Ts(w.Time)} · {H(w.ProcessName)}");
+            sb.Append($"<div class=\"card wake{(w.KernelInitiated || w.Failed ? " sys" : "")}\"><h3>#{i} · {Ts(w.Time)} · {H(w.ProcessName)}");
             sb.Append($"<span class=\"tag\">+{Dur(w.Time - a.Start)}</span>");
+            if (w.Failed) sb.Append($"<span class=\"tag\">request failed · not counted</span>");
+            if (!w.PriorStateKnown) sb.Append("<span class=\"tag\">prior state unknown</span>");
             if (w.KernelInitiated) sb.Append("<span class=\"tag\">kernel-initiated</span>");
             sb.Append("</h3><table class=\"kv\">");
             Row(sb, "Process", $"{H(w.ProcessName)} (PID {w.Pid}, TID {w.Tid})");
             if (w.ImagePath != null) Row(sb, "Image", $"<span class=\"mono\">{H(w.ImagePath)}</span>");
             if (w.CommandLine != null) Row(sb, "Command line", $"<span class=\"mono\">{H(w.CommandLine)}</span>");
-            Row(sb, "Awake for", w.SleptAt is { } s ? $"{Dur(s - w.Time)} (back to D3 at {Ts(s)})" : "still in D0 when recording stopped");
+            if (w.Failed) Row(sb, "D0 request", $"failed with status <span class=\"mono\">0x{w.FailStatus:X8}</span>; the device stayed in its low-power state");
+            else Row(sb, "Awake for", w.SleptAt is { } s ? $"{Dur(s - w.Time)} (back to D3 at {Ts(s)})" : "still in D0 when recording stopped");
+            if (!w.Failed && !w.Completed) Row(sb, "Completion", "<span style=\"color:var(--muted)\">IRP completion not seen in the trace</span>");
             Row(sb, "Entry module", w.EntryModule != null ? $"<span class=\"mono\">{H(w.EntryModule)}</span>" : "<span style=\"color:var(--muted)\">no user-mode frames</span>");
             if (w.CallerModule != null) Row(sb, "Caller module", $"<span class=\"mono\">{H(w.CallerModule)}</span>");
             Row(sb, "DxgKrnl reason", w.Reason?.ToString() ?? "<span style=\"color:var(--muted)\">no PowerRequestDuringD3 on this thread</span>");
@@ -151,6 +157,14 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
             sb.Append("</div>");
         }
 
+        if (a.Ignored.Count > 0)
+        {
+            sb.Append($"<h2>D0 requests not counted ({a.Ignored.Count})</h2><div class=\"card scroll\"><table><tr><th>Time</th><th>Process</th><th class=\"num\">PID</th><th>Why</th></tr>");
+            foreach (var r in a.Ignored)
+                sb.Append($"<tr><td>{Ts(r.Time)}</td><td>{H(r.ProcessName)}</td><td class=\"num\">{r.Pid}</td><td>{H(r.Why)}</td></tr>");
+            sb.Append("</table></div>");
+        }
+
         // System info
         sb.Append("<h2>Recording</h2><div class=\"card scroll\"><table class=\"kv\">");
         Row(sb, "Computer", H(Environment.MachineName));
@@ -159,7 +173,7 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
         Row(sb, "Instance ID", $"<span class=\"mono\">{H(ctx.Device.InstanceId)}</span>");
         Row(sb, "Started", H(a.Start.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")));
         Row(sb, "Duration", Dur(a.Duration));
-        Row(sb, "State at start", State(a.InitialState));
+        Row(sb, "State at start", State(a.InitialState) + (a.InitialState < 0 ? "" : a.InitialStateMeasured ? " · measured" : " · inferred from the first request"));
         Row(sb, "State at end", State(ctx.StateAtEnd));
         Row(sb, "Events in trace", a.TotalEvents.ToString("N0"));
         Row(sb, "Events lost", ctx.EventsLost == 0 ? "0" : $"<b style=\"color:var(--bad)\">{ctx.EventsLost:N0}</b>");
@@ -168,8 +182,9 @@ code{font-family:var(--mono);font-size:12.5px;background:var(--bg);padding:1px 5
         sb.Append("</table></div>");
 
         sb.Append("""
-<footer>Wakes are detected from Kernel-Power <code>IRP_MN_SET_POWER</code> (D0) requests for the device, attributed to the requesting thread,
-and correlated with DxgKrnl <code>PowerRequestDuringD3</code>. Open the trace file in Windows Performance Analyzer for deeper analysis.</footer>
+<footer>A wake is a Kernel-Power <code>IRP_MN_SET_POWER</code> D0 request for the device made while it was not in D0, attributed to the
+requesting thread. Requests whose IRP completed with a failure status are listed but not counted. The reason code comes from a matching
+DxgKrnl <code>PowerRequestDuringD3</code> event. Open the trace file in Windows Performance Analyzer for deeper analysis.</footer>
 </main></body></html>
 """);
         return sb.ToString();

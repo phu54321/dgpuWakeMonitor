@@ -33,13 +33,20 @@ static class Program
         var log = new StreamWriter(Path.ChangeExtension(args[2], ".log")) { AutoFlush = true };
         try
         {
+            // The recording's sidecar knows the device and its state when tracing started.
+            var meta = RecordingMeta.TryLoad(args[1]);
             int di = Array.IndexOf(args, "--device");
-            var device = GpuDevice.Pick(GpuDevice.Enumerate(), di > 0 && di + 1 < args.Length ? args[di + 1] : null)
+            var match = di > 0 && di + 1 < args.Length ? args[di + 1] : meta?.InstanceId;
+            var device = GpuDevice.Pick(GpuDevice.Enumerate(), match)
+                         ?? (meta != null ? new GpuDevice(meta.InstanceId, meta.DeviceName) : null)
                          ?? throw new InvalidOperationException("No discrete GPU found.");
             bool symbols = args.Contains("--symbols");
-            var analysis = Analyzer.Analyze(args[1], device.InstanceId, symbols, log);
+            int initialState = meta != null && string.Equals(meta.InstanceId, device.InstanceId, StringComparison.OrdinalIgnoreCase)
+                ? meta.InitialState : -1;
+            log.WriteLine(meta != null ? $"meta: initial state D{initialState}" : "meta: none (initial state will be inferred)");
+            var analysis = Analyzer.Analyze(args[1], device.InstanceId, initialState, symbols, log);
             File.WriteAllText(args[2], Report.Build(analysis, new ReportContext(device, args[1], 0, device.GetPowerState(), symbols)));
-            log.WriteLine($"OK: {analysis.Wakes.Count} wakes, {analysis.TotalEvents} events");
+            log.WriteLine($"OK: {analysis.CountedWakes.Count()} wakes, {analysis.Wakes.Count(w => w.Failed)} failed, {analysis.Ignored.Count} ignored, {analysis.TotalEvents} events");
             return 0;
         }
         catch (Exception ex) { log.WriteLine(ex); return 1; }

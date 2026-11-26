@@ -35,6 +35,8 @@ sealed class MainForm : Form
     string? _runDir;
     string? _reportPath;
     DateTime _startedAt;
+    int _initialState = -1;
+    readonly Dictionary<int, ListViewItem> _liveRows = new();
     bool _busy;
 
     public MainForm()
@@ -158,11 +160,19 @@ sealed class MainForm : Form
             _reportPath = null;
             _openReport.Enabled = false;
             _list.Items.Clear();
+            _liveRows.Clear();
 
-            _recorder = new Recorder(Path.Combine(_runDir, "dgpu-wake.etl"));
-            _live = new LiveMonitor(_device.InstanceId);
+            // Measure the state *before* tracing starts so the first D0 request can be classified.
+            _initialState = _device.GetPowerState();
+            var etlPath = Path.Combine(_runDir, "dgpu-wake.etl");
+            new RecordingMeta(_device.InstanceId, _device.Name, _initialState, DateTime.Now).Save(etlPath);
+
+            _recorder = new Recorder(etlPath);
+            _live = new LiveMonitor(_device.InstanceId, _initialState);
             _live.Wake += w => BeginInvoke(() => OnLiveWake(w));
-            _live.Sleep += (t, d) => BeginInvoke(() => OnLiveSleep(t, d));
+            _live.Sleep += (id, t, d) => BeginInvoke(() => OnLiveSleep(id, t, d));
+            _live.WakeFailed += (id, status) => BeginInvoke(() => OnLiveWakeFailed(id, status));
+            _live.Ignored += (t, proc, why) => BeginInvoke(() => Log($"[{t.ToLocalTime():HH:mm:ss.fff}] D0 request from {proc} not counted: {why}"));
             _live.NameResolved += (pid, name) => BeginInvoke(() =>
             {
                 foreach (ListViewItem it in _list.Items)
@@ -175,7 +185,8 @@ sealed class MainForm : Form
             _start.Enabled = false;
             _stop.Enabled = true;
             Log($"Recording started → {_recorder.EtlPath}");
-            Log($"dGPU is currently {StateName(_device.GetPowerState())}. Waiting for wakes… (press Stop to build the report)");
+            Log($"dGPU was {StateName(_initialState)} when recording started. Waiting for wakes… (press Stop to build the report)");
+            Log("Live view runs ~3 s behind so events can be put in order.");
         }
         catch (Exception ex)
         {
@@ -188,15 +199,22 @@ sealed class MainForm : Form
     {
         var item = new ListViewItem([w.Time.ToLocalTime().ToString("HH:mm:ss.fff"), w.Process, w.Pid.ToString(), w.Reason?.ToString() ?? "", "…", "", ""])
         { Tag = w, ForeColor = Color.Firebrick };
+        _liveRows[w.Id] = item;
         _list.Items.Add(item);
         item.EnsureVisible();
-        Log($"[{w.Time.ToLocalTime():HH:mm:ss.fff}] WAKE  D3→D0  {w.Process} (pid {w.Pid}, tid {w.Tid}){(w.Reason is { } r ? $"  reason={r}" : "")}");
+        Log($"[{w.Time.ToLocalTime():HH:mm:ss.fff}] WAKE  D3→D0  {w.Process} (pid {w.Pid}, tid {w.Tid}){(w.Reason is { } r ? $"  reason={r}" : "")}{(w.PriorStateKnown ? "" : "  (prior state unknown)")}");
     }
 
-    void OnLiveSleep(DateTime t, TimeSpan? awake)
+    void OnLiveSleep(int id, DateTime t, TimeSpan awake)
     {
-        if (_list.Items.Count > 0 && awake is { } a) _list.Items[^1].SubItems[4].Text = $"{a.TotalSeconds:0.00} s";
-        Log($"[{t.ToLocalTime():HH:mm:ss.fff}] SLEEP D0→D3{(awake is { } d ? $"  after {d.TotalSeconds:0.00} s" : "")}");
+        if (_liveRows.TryGetValue(id, out var item)) item.SubItems[4].Text = $"{awake.TotalSeconds:0.00} s";
+        Log($"[{t.ToLocalTime():HH:mm:ss.fff}] SLEEP D0→D3  after {awake.TotalSeconds:0.00} s");
+    }
+
+    void OnLiveWakeFailed(int id, uint status)
+    {
+        if (_liveRows.TryGetValue(id, out var item)) { item.ForeColor = SystemColors.GrayText; item.SubItems[4].Text = "failed"; }
+        Log($"  D0 request #{id} failed (status 0x{status:X8}); not counted");
     }
 
     async Task StopRecordingAsync()
@@ -213,6 +231,7 @@ sealed class MainForm : Form
 
         bool symbols = _symbols.Checked;
         var device = _device;
+        int initialState = _initialState;
         var uiLog = new UiLogWriter(this);
         SetStatus(symbols ? "Analyzing trace and resolving symbols…" : "Analyzing trace…");
         try
@@ -220,12 +239,12 @@ sealed class MainForm : Form
             var sw = Stopwatch.StartNew();
             var (analysis, html) = await Task.Run(() =>
             {
-                var a = Analyzer.Analyze(recorder.EtlPath, device.InstanceId, symbols, uiLog);
+                var a = Analyzer.Analyze(recorder.EtlPath, device.InstanceId, initialState, symbols, uiLog);
                 return (a, Report.Build(a, new ReportContext(device, recorder.EtlPath, lost, device.GetPowerState(), symbols)));
             });
             _reportPath = Path.Combine(_runDir!, "dgpu-wake-report.html");
             await File.WriteAllTextAsync(_reportPath, html);
-            Log($"Analyzed {analysis.TotalEvents:N0} trace events in {sw.Elapsed.TotalSeconds:0.0} s: {analysis.Wakes.Count} wake(s){(lost > 0 ? $", {lost:N0} events LOST" : "")}.");
+            Log($"Analyzed {analysis.TotalEvents:N0} trace events in {sw.Elapsed.TotalSeconds:0.0} s: {analysis.CountedWakes.Count()} wake(s){(analysis.Ignored.Count > 0 ? $", {analysis.Ignored.Count} D0 request(s) not counted" : "")}{(lost > 0 ? $", {lost:N0} events LOST" : "")}.");
             Log($"Report → {_reportPath}");
             ShowAnalysis(analysis);
             _openReport.Enabled = true;
@@ -250,9 +269,10 @@ sealed class MainForm : Form
         _list.Items.Clear();
         foreach (var w in a.Wakes)
         {
-            var awake = w.SleptAt is { } s ? $"{(s - w.Time).TotalSeconds:0.00} s" : "until end";
+            var awake = w.Failed ? "failed" : w.SleptAt is { } s ? $"{(s - w.Time).TotalSeconds:0.00} s" : "until end";
+            var color = w.Failed ? SystemColors.GrayText : w.KernelInitiated ? Color.SteelBlue : Color.Firebrick;
             _list.Items.Add(new ListViewItem([w.Time.ToLocalTime().ToString("HH:mm:ss.fff"), w.ProcessName, w.Pid.ToString(),
-                w.Reason?.ToString() ?? "", awake, w.EntryModule ?? "", w.CallerModule ?? ""]) { ForeColor = w.KernelInitiated ? Color.SteelBlue : Color.Firebrick });
+                w.Reason?.ToString() ?? "", awake, w.EntryModule ?? "", w.CallerModule ?? ""]) { ForeColor = color });
         }
         _list.EndUpdate();
     }

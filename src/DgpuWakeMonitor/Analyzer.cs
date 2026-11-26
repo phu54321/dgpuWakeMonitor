@@ -26,33 +26,44 @@ public sealed class WakeRecord
     /// <summary>First user-mode module outside Windows / the driver store, i.e. the app code that called in.</summary>
     public string? CallerModule { get; set; }
     public bool KernelInitiated => Pid is 0 or 4;
+    /// <summary>False when the device state before this request could not be established.</summary>
+    public bool PriorStateKnown { get; init; } = true;
+    /// <summary>The D0 IRP completed successfully.</summary>
+    public bool Completed { get; init; }
+    /// <summary>The D0 IRP failed (device did not reach D0); not counted as a wake.</summary>
+    public bool Failed { get; init; }
+    public uint? FailStatus { get; init; }
 }
+
+public sealed record IgnoredInfo(DateTime Time, int Pid, string ProcessName, string Why);
 
 public sealed class Analysis
 {
     public required DateTime Start { get; init; }
     public required DateTime End { get; init; }
+    /// <summary>All D0 requests that changed (or tried to change) the state, failed ones included.</summary>
     public required List<WakeRecord> Wakes { get; init; }
-    public int? InitialState { get; init; }
+    /// <summary>D0 requests that were not wakes, e.g. made while the device was already in D0.</summary>
+    public required List<IgnoredInfo> Ignored { get; init; }
+    /// <summary>D-state at the start (0..3), or -1 if unknown.</summary>
+    public int InitialState { get; init; } = -1;
+    public bool InitialStateMeasured { get; init; }
+    public DateTime? InitialD0End { get; init; }
     public long TotalEvents { get; init; }
     public TimeSpan Duration => End - Start;
+    public IEnumerable<WakeRecord> CountedWakes => Wakes.Where(w => !w.Failed);
 
-    /// <summary>Time spent in D0 inside the recording window (open intervals run to the end).</summary>
-    public TimeSpan TimeInD0
+    /// <summary>D0 intervals inside the recording window (open intervals run to the end).</summary>
+    public IEnumerable<(DateTime From, DateTime To, WakeRecord? Wake)> D0Intervals
     {
         get
         {
-            var t = TimeSpan.Zero;
-            if (InitialState == 0)
-            {
-                var firstSleep = FirstSleepBeforeFirstWake;
-                t += (firstSleep ?? (Wakes.Count > 0 ? Wakes[0].Time : End)) - Start;
-            }
-            foreach (var w in Wakes) t += (w.SleptAt ?? End) - w.Time;
-            return t;
+            if (InitialState == 0) yield return (Start, InitialD0End ?? End, null);
+            foreach (var w in CountedWakes) yield return (w.Time, w.SleptAt ?? End, w);
         }
     }
-    public DateTime? FirstSleepBeforeFirstWake { get; init; }
+
+    public TimeSpan TimeInD0 => TimeSpan.FromTicks(D0Intervals.Sum(i => (i.To - i.From).Ticks));
 }
 
 static class Analyzer
@@ -62,7 +73,7 @@ static class Analyzer
         "ntdll", "win32u", "gdi32", "gdi32full", "kernelbase", "kernel32", "user32", "ucrtbase", "msvcrt",
     };
 
-    public static Analysis Analyze(string etlPath, string instanceId, bool resolveSymbols, TextWriter log)
+    public static Analysis Analyze(string etlPath, string instanceId, int initialState, bool resolveSymbols, TextWriter log)
     {
         // Convert into a temp file this analysis owns. OpenOrConvert would reuse (and we'd then delete)
         // a sibling .etlx that might belong to the user, e.g. from PerfView.
@@ -80,54 +91,45 @@ static class Analyzer
         }
         try
         {
-            var wakes = new List<WakeRecord>();
-            // TraceEvent objects are reused across iterations, so never keep one: take what we need
-            // (including the call stack, which is a stable index into the log) while it is current.
-            var lastRequest = new Dictionary<int, (DateTime time, int reason, TraceCallStack? stack)>();
-            var stackSources = new Dictionary<WakeRecord, (TraceCallStack? irp, TraceCallStack? req)>();
-            WakeRecord? open = null;
-            int? initialState = null;
-            DateTime? firstSleep = null;
+            var tracker = new PowerTracker(initialState);
             long total = 0;
+
+            // TraceEvent objects are reused across iterations, so never keep one: the tagger copies what
+            // we need (including call stacks, which are stable indexes into the log) while it is current.
+            object? Tag(TraceEvent e, PowerEvtKind kind)
+            {
+                if (kind == PowerEvtKind.DxgRequest) return e.CallStack();
+                var proc = e.Process();
+                return new IrpInfo(e.CallStack(), NameFor(e.ProcessID, proc),
+                    proc?.ImageFileName is { Length: > 0 } img ? img : null,
+                    proc?.CommandLine is { Length: > 0 } c ? c : null);
+            }
 
             foreach (var e in traceLog.Events)
             {
                 total++;
-                if (Etw.IsPowerRequestDuringD3(e))
-                {
-                    lastRequest[e.ThreadID] = (e.TimeStamp, Convert.ToInt32(e.PayloadByName("Reason") ?? 0), e.CallStack());
-                    continue;
-                }
-                int state = Etw.TryGetDevicePowerIrp(e, instanceId);
-                if (state < 0) continue;
-
-                if (state == 0)
-                {
-                    initialState ??= 3;
-                    var proc = e.Process();
-                    var w = new WakeRecord
-                    {
-                        Time = e.TimeStamp, Pid = e.ProcessID, Tid = e.ThreadID,
-                        ProcessName = NameFor(e.ProcessID, proc),
-                        ImagePath = proc?.ImageFileName is { Length: > 0 } ? proc.ImageFileName : null,
-                        CommandLine = proc?.CommandLine is { Length: > 0 } c ? c : null,
-                    };
-                    TraceCallStack? reqStack = null;
-                    if (lastRequest.TryGetValue(e.ThreadID, out var r) && (e.TimeStamp - r.time).TotalMilliseconds < 250)
-                    {
-                        w.Reason = r.reason;
-                        reqStack = r.stack;
-                    }
-                    stackSources[w] = (e.CallStack(), reqStack);
-                    wakes.Add(w);
-                    open = w;
-                }
-                else if (state == 3)
-                {
-                    if (initialState == null) { initialState = 0; firstSleep = e.TimeStamp; }
-                    if (open != null) { open.SleptAt = e.TimeStamp; open = null; }
-                }
+                if (Etw.Parse(e, instanceId, Tag) is { } pe) tracker.Process(pe);
             }
+
+            var wakes = new List<WakeRecord>();
+            var stackSources = new Dictionary<WakeRecord, (TraceCallStack? irp, TraceCallStack? req)>();
+            foreach (var t in tracker.Wakes)
+            {
+                var info = t.IrpTag as IrpInfo;
+                var w = new WakeRecord
+                {
+                    Time = t.Time, Pid = t.Pid, Tid = t.Tid,
+                    ProcessName = info?.Name ?? NameFor(t.Pid, null),
+                    ImagePath = info?.Image, CommandLine = info?.CommandLine,
+                    Reason = t.Reason, SleptAt = t.SleptAt, PriorStateKnown = t.PriorStateKnown,
+                    Completed = t.Completed, Failed = t.Failed, FailStatus = t.FailStatus,
+                };
+                stackSources[w] = (info?.Stack, t.RequestTag as TraceCallStack);
+                wakes.Add(w);
+            }
+            var ignored = tracker.Ignored
+                .Select(r => new IgnoredInfo(r.Time, r.Pid, (r.Tag as IrpInfo)?.Name ?? NameFor(r.Pid, null), r.Why))
+                .ToList();
 
             if (resolveSymbols && wakes.Count > 0)
                 ResolveSymbols(traceLog, stackSources.Values.SelectMany(s => new[] { s.irp, s.req }), log);
@@ -143,8 +145,9 @@ static class Analyzer
 
             return new Analysis
             {
-                Start = traceLog.SessionStartTime, End = traceLog.SessionEndTime, Wakes = wakes,
-                InitialState = initialState, FirstSleepBeforeFirstWake = firstSleep, TotalEvents = total,
+                Start = traceLog.SessionStartTime, End = traceLog.SessionEndTime, Wakes = wakes, Ignored = ignored,
+                InitialState = tracker.InitialState, InitialStateMeasured = tracker.InitialStateMeasured,
+                InitialD0End = tracker.InitialD0End, TotalEvents = total,
             };
         }
         finally
@@ -153,6 +156,8 @@ static class Analyzer
             try { File.Delete(etlxPath); } catch { }
         }
     }
+
+    sealed record IrpInfo(TraceCallStack? Stack, string Name, string? Image, string? CommandLine);
 
     static string NameFor(int pid, TraceProcess? p)
     {
