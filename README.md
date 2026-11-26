@@ -1,75 +1,41 @@
 # dgpuWakeMonitor
 
-Finds out **which process woke the discrete GPU** (D3 → D0) on hybrid-graphics laptops.
-It records the same ETW data you'd capture with WPR, inside the app, and turns it into an HTML report
-in the style of `powercfg /energy`.
+Finds out **which app keeps waking up your laptop's graphics card** (NVIDIA/AMD), draining the battery.
+
+![dgpuWakeMonitor window](docsImg/screenshot.png)
 
 ## Usage
 
-Run `dgpuWakeMonitor.exe` (it asks for administrator rights, which ETW needs). Recording starts right away:
+Is your laptop's battery draining faster than it should, or are its fans spinning with nothing open?
+A common cause is an app that keeps waking up the NVIDIA/AMD graphics chip, which is supposed to sleep
+until you start a game. This tool shows you which app it is.
 
-- **events captured / elapsed / wakes / trace size** update live
-- each wake appears once the D0 request completes (process, PID, DxgKrnl reason, time spent awake)
-- the **Log** pane (collapsible) shows what's happening
-- **Stop & build report** stops the trace, analyzes it, and opens `dgpu-wake-report.html`
+1. Run `dgpuWakeMonitor.exe`. Click **Yes** when Windows asks for permission.
+2. Recording starts automatically. Use your laptop as usual.
+   The badge next to the GPU name shows whether it's **asleep** or **awake** right now.
+3. Every time something wakes the GPU, a new row appears showing **which app** did it and **how long** the GPU stayed awake.
+4. When you've seen enough, click **Stop & build report**. A detailed report opens in your browser.
 
-Output goes to `%LOCALAPPDATA%\DgpuWakeMonitor\recordings\<timestamp>\`:
-`dgpu-wake-report.html` plus `dgpu-wake.etl`, which you can open in Windows Performance Analyzer.
+Tips:
 
-Tick **Resolve symbols** before stopping to resolve Windows frames (e.g. `win32u!NtGdiDdDDIQueryAdapterInfo`)
-via the Microsoft symbol server (cached under `%LOCALAPPDATA%\DgpuWakeMonitor\symbols`; `_NT_SYMBOL_PATH` is honored).
-NVIDIA user-mode DLLs have no public symbols, so they stay as `module+offset`.
+- Leave it running for a few minutes, or as long as it takes for the problem to happen again.
+- **Open folder** shows where your recordings are saved. Each recording gets its own folder.
+- If you close the window while it's still recording, it asks whether to build the report first.
 
-Re-analyze an existing trace without the GUI:
+In the screenshot above, it's `Discord.exe`, and that was the real cause on that laptop.
+Other apps you'll often see:
 
-```powershell
-dgpuWakeMonitor --analyze <trace.etl> <report.html> [--symbols] [--device <name or instance-id substring>]
-```
+- **`chrome.exe`** (and other browsers): fix it by making the app use only the integrated GPU.
+  Open **Settings → System → Display → Graphics**, pick the app, and set it to **Power saving**.
+  The same setting is worth trying for `Discord.exe` and other apps.
+- **`System`**: Windows itself woke the GPU. Live with it: you can't uninstall Windows.
+- **`nvcontainer.exe`**: NVIDIA's background service. If it only shows up now and then, live with it.
+  If it wakes the GPU often, something may be wrong. You could try disabling the NVIDIA container service,
+  but I don't recommend it.
 
-## How it works
+## Advanced
 
-Two ETW sessions run side by side:
-
-| Session | Mode | Providers | Purpose |
-|---|---|---|---|
-| `DgpuWakeMonitor-Live` | real-time | Kernel-Power (0x8), DxgKrnl (0x400000), Kernel-Process (0x10) | live counter + wake list |
-| `DgpuWakeMonitor-Record` | ETL file | kernel Process+ImageLoad, plus the above with stacks on event IDs 7 and 368 | full call stacks for the report |
-
-The signal, checked against real traces on an RTX 5060 Laptop GPU:
-
-- **Kernel-Power event 7 (`Irp` start)** with `MinorFunction=2` (SET_POWER), `PowerStateType=1` (device),
-  `InstanceName` = the dGPU, and `PowerState=0` is the D0 wake request (`3` = back to D3).
-  It fires **on the requesting thread**, so its PID/TID is the culprit.
-- **Kernel-Power event 8 (`Irp` stop)** completes that IRP (same `Irp` pointer) with an NTSTATUS.
-- **DxgKrnl event 368 (`PowerRequestDuringD3`)** fires on the same thread just before it, with a `Reason` code
-  and the adapter's context. It also fires for the iGPU.
-
-What counts as a wake (`PowerTracker`, shared by the live view and the report):
-
-- The dGPU's D-state is measured *before* tracing starts and saved in `dgpu-wake.meta.json` next to the ETL.
-  Without that file (e.g. a foreign trace), the starting state is unknown.
-- A successful D0 request counts as a wake when the preceding known state was D3.
-  Requests from other states, failures, and requests with missing completions are excluded from the wake count.
-- D0 time starts at a successful D0 completion, or at the start of a recording that began in D0.
-  Successful transitions out of D0 close the interval. If a power-down request is still unresolved at the
-  end of the trace, the report stops measuring the open interval at that request.
-- The DxgKrnl reason is matched by PID and TID, must precede the IRP by at most 250 ms, and is used once.
-  The dGPU's adapter context is learned from repeated matches, so a reason is shown as *verified*,
-  as an *unverified hint*, or dropped when only another adapter's request is present.
-- The live view holds events about 3 s so it can process them in time order, because real-time ETW isn't
-  globally ordered.
-- The report warns rather than saying "No dGPU wakes" when events were lost, when Kernel-Power data is missing,
-  or when the dGPU requests lack the `PowerState` field (Kernel-Power event 7 version 0 on older builds).
-
-The report's stacks come from the ETL, because real-time sessions only deliver the kernel half of the stack.
-For example, `nvidia-smi` waking the GPU looks like this:
-
-```text
-nvidia-smi → nvml → win32u!NtGdiDdDDIQueryAdapterInfo → dxgkrnl!DxgkQueryAdapterInfo
-  → nvlddmkm → dxgkrnl!DxgSetPowerComponentActiveCB → PoFxActivateComponent → D0 IRP
-```
-
-The current D-state shown in the header is read from `DEVPKEY_Device_PowerData`, which does not wake the device.
+For where recordings are saved, symbol resolution, the command line, and how wakes are detected, see [README_ADVANCED.md](README_ADVANCED.md).
 
 ## Build
 
